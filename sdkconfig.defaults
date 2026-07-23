@@ -1,0 +1,49 @@
+# Target + flash — Waveshare ESP32-S3 audio board: ESP32-S3, 16MB flash, PSRAM.
+CONFIG_IDF_TARGET="esp32s3"
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Octal PSRAM @80MHz. esp-sr's AFE allocates its working buffers (and we allocate
+# the capture buffer) with MALLOC_CAP_SPIRAM, so PSRAM is REQUIRED, not optional.
+# NOTE: if this specific module turns out to be QUAD PSRAM, boot fails to map
+# SPIRAM — swap SPIRAM_MODE_OCT for CONFIG_SPIRAM_MODE_QUAD. Confirm from the
+# module marking / `esptool flash_id`.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_FETCH_INSTRUCTIONS=y
+CONFIG_SPIRAM_RODATA=y
+
+# AFE runs in real time; keep both cores at full clock.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Custom partition table: dual-OTA app slots + the esp-sr "model" SPIFFS
+# partition (see partitions.csv). Table lives at 0x8000 (standard).
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_OFFSET=0x8000
+
+# esp-sr: WakeNet + VAD models live in the flash "model" partition. WakeNet9
+# "Hi ESP" as the trigger; no on-device command recognition (MultiNet off) — we
+# stream the post-wake audio to a real STT server instead. WebRTC VAD (light,
+# no model) drives end-of-utterance detection.
+CONFIG_MODEL_IN_FLASH=y
+CONFIG_AFE_INTERFACE_V1=y
+CONFIG_SR_WN_WN9_HIESP=y
+CONFIG_SR_MN_EN_NONE=y
+CONFIG_SR_MN_CN_NONE=y
+CONFIG_SR_VADN_WEBRTC=y
+
+# OTA rollback: a freshly-OTA'd image boots PENDING_VERIFY; app_main marks it
+# valid once Wi-Fi is back (see otaVerifyTask). Any failure rolls back.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# app_main only wires things up and spawns tasks.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# STT POST is plain HTTP on the LAN (endpoint is a runtime setting).
+CONFIG_ESP_HTTP_CLIENT_ENABLE_HTTPS=n
+
+# C++: mianesp components use std::function / std::regex.
+CONFIG_COMPILER_CXX_EXCEPTIONS=y
+CONFIG_COMPILER_CXX_RTTI=y

@@ -1,0 +1,15 @@
+# ESP-IDF Partition Table — 16MB flash: dual-OTA + esp-sr model store.
+#
+# nvs keeps its standard offset so Wi-Fi creds / hostname / settings survive OTA
+# partition swaps. Two 3MB app slots (the app + esp-sr link in well under that).
+# The "model" SPIFFS partition holds the WakeNet + VAD model data; esp-sr's build
+# integration finds it *by the name "model"* and flashes srmodels.bin into it, and
+# the app mounts it via esp_srmodel_init("model"). 6MB leaves room to add MultiNet
+# later without repartitioning.
+# Name,     Type, SubType, Offset,    Size,     Flags
+nvs,        data, nvs,     0x9000,    0x6000,
+otadata,    data, ota,     0xf000,    0x2000,
+phy_init,   data, phy,     0x11000,   0x1000,
+ota_0,      app,  ota_0,   0x20000,   0x300000,
+ota_1,      app,  ota_1,   0x320000,  0x300000,
+model,      data, spiffs,  0x620000,  0x600000,

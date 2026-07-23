@@ -1,0 +1,27 @@
+stages:
+  - test
+  - build
+
+# Pure host unit tests for the WAV + multipart wire builders (no ESP-IDF / hardware).
+host-tests:
+  stage: test
+  image: gcc:13
+  script:
+    - bash test/host/run.sh
+
+# Full firmware build for esp32s3 (Waveshare audio board) under ESP-IDF v6.0.
+build-firmware:
+  stage: build
+  image: espressif/idf:release-v6.0
+  variables:
+    IDF_TARGET: esp32s3
+  script:
+    - . "$IDF_PATH/export.sh"
+    - idf.py set-target esp32s3
+    - idf.py build
+  artifacts:
+    paths:
+      - build/ws_voice.bin
+      - build/bootloader/bootloader.bin
+      - build/partition_table/partition-table.bin
+    expire_in: 1 week
