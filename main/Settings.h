@@ -24,6 +24,14 @@ struct Settings : SettingsBase {
     std::string sttModel    = "whisper-1";  // model form field
     std::string sttLanguage = "en";         // language hint; "" omits the field
 
+    // TTS ("say" command): FastKoko (Kokoro-FastAPI) OpenAI-compatible speech
+    // endpoint. The device requests response_format=pcm (raw 16-bit, no
+    // container) and never resamples — ?sample_rate=16000 in the URL is a
+    // FastKoko extension that makes the server deliver audio already at the
+    // board's native rate. say refuses (and logs) if this is blanked.
+    std::string ttsUrl   = "http://docker-host.mianos.com:8880/v1/audio/speech?sample_rate=16000";
+    std::string ttsVoice = "af_heart";
+
     // Capture end-of-utterance tuning.
     int vadSilenceMs     = 700;    // stop after this much continuous silence
     int maxCaptureMs     = 8000;   // hard cap on a single utterance
@@ -42,6 +50,8 @@ struct Settings : SettingsBase {
         field("stt_url",      sttUrl);
         field("stt_model",    sttModel);
         field("stt_language", sttLanguage);
+        field("tts_url",      ttsUrl);
+        field("tts_voice",    ttsVoice);
         field("vad_silence_ms", vadSilenceMs);
         field("max_capture_ms", maxCaptureMs);
         field("publish_wake",   publishWakeEvent);

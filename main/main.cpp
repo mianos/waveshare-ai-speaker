@@ -7,19 +7,25 @@
 // components (wifimanager, mqttwrapper, settingsbase, webserver, jsonwrapper)
 // with doorbell3 / ldr3 / atomecho.
 //
-// Optionally (play_tone, default on) plays a short chime out the ES8311 speaker
-// at boot, on first Wi-Fi connect, and a blip on each wakeword. The speaker DAC
-// is brought up separately from the mic and is non-fatal, so it can never stall
-// boot. The on-board RGB LED lights green while a wakeword is being captured.
+// The ES8311 speaker (independent of the mic, always brought up best-effort —
+// see bsp_audio_out_init) plays a short chime at boot, on first Wi-Fi connect,
+// and a blip on each wakeword (all gated on play_tone, default on), plus
+// on-demand speech via the "say" command (FastKoko/Kokoro-FastAPI TTS, see
+// tts_url). DAC bring-up is non-fatal, so audio failures can never stall boot
+// or take down the mic/MQTT path. The on-board RGB LED lights green while a
+// wakeword is being captured.
 //
 // MQTT (cmnd/<name>/...):
 //   settings    any subset of the /config JSON (e.g. {"stt_url": "..."})
+//   say         {"text":"...", "voice":"..."}   voice optional; speak via TTS
 //   restart     {}
 //   reprovision {}   clears Wi-Fi creds, reboots into ESP-Touch v2 provisioning
 // Publishes:
 //   tele/<name>/wake      {"event":"wake"}                on each wakeword
 //   tele/<name>/stt       {"text":...,"ms":...,"stt_ms":...}  on transcription
 //   tele/<name>/stterror  {...}                           on STT failure
+//   tele/<name>/tts       {"text":...,"ms":...,"tts_ms":...}  on speech played
+//   tele/<name>/ttserror  {...}                           on TTS failure
 //   tele/<name>/init,status                               identity + telemetry
 
 #include <string>
@@ -51,6 +57,7 @@
 
 #include "board.h"
 #include "SttClient.h"
+#include "TtsClient.h"
 #include "VoicePipeline.h"
 #include "ToneGen.h"
 
@@ -95,6 +102,7 @@ struct App {
     Settings*    settings;
     MqttClient*  mqtt;
     WiFiManager* wifi;
+    TtsClient*   tts = nullptr;  // set once constructed, later in app_main
 };
 
 std::string uptimeString() {
@@ -123,6 +131,18 @@ esp_err_t handleSettings(MqttClient*, const std::string&, const JsonWrapper& d, 
     app->settings->loadFromJson(d);
     app->settings->save();
     app->settings->log();
+    return ESP_OK;
+}
+
+esp_err_t handleSay(MqttClient*, const std::string&, const JsonWrapper& d, void* ctx) {
+    auto* app = static_cast<App*>(ctx);
+    std::string text, voice;
+    if (!d.GetField("text", text) || text.empty()) {
+        ESP_LOGW(TAG, "say command without text");
+        return ESP_OK;
+    }
+    d.GetField("voice", voice);
+    if (app->tts) app->tts->speak(text, voice);
     return ESP_OK;
 }
 
@@ -240,6 +260,7 @@ extern "C" void app_main(void) {
 
     const std::string b = "cmnd/" + settings.sensorName + "/";
     mqtt.registerHandler(b + "settings",    std::regex(b + "settings"),    handleSettings,    &app);
+    mqtt.registerHandler(b + "say",         std::regex(b + "say"),         handleSay,         &app);
     mqtt.registerHandler(b + "restart",     std::regex(b + "restart"),     handleRestart,     &app);
     mqtt.registerHandler(b + "reprovision", std::regex(b + "reprovision"), handleReprovision, &app);
     mqtt.start();
@@ -252,20 +273,21 @@ extern "C" void app_main(void) {
     // Flashed green by the voice pipeline while a wakeword is being captured.
     bsp_led_init();
 
-    // Speaker tones (opt-in; see Settings::playTone). Brought up AFTER the mic
-    // ADC and BEFORE the feed task starts, and deliberately NOT ESP_ERROR_CHECK'd
-    // — a DAC failure must never take the mic/MQTT path down. Play the start tone
-    // here (I2S idle) and arm the connected tone for the first IP.
-    if (settings.playTone) {
-        esp_err_t ar = bsp_audio_out_init();
-        ESP_LOGI(TAG, "play_tone enabled; audio out init: %s", esp_err_to_name(ar));
-        if (ar == ESP_OK) {
+    // Speaker DAC (ES8311). Brought up unconditionally, AFTER the mic ADC and
+    // BEFORE the feed task starts, and deliberately NOT ESP_ERROR_CHECK'd — a
+    // DAC failure must never take the mic/MQTT path down. Unconditional (not
+    // gated on play_tone) because both the tone cues below AND on-demand TTS
+    // ("say") need it; play_tone only gates whether the tone cues play.
+    esp_err_t audioOutRet = bsp_audio_out_init();
+    ESP_LOGI(TAG, "audio out init: %s", esp_err_to_name(audioOutRet));
+    if (audioOutRet == ESP_OK) {
+        if (settings.playTone) {
             ESP_LOGI(TAG, "playing start tone");
             playChime(kStartChime, sizeof(kStartChime) / sizeof(kStartChime[0]));
             xTaskCreate(connectChimeTask, "connchime", 4096, nullptr, 4, nullptr);
         }
     } else {
-        ESP_LOGI(TAG, "play_tone disabled (speaker tones off)");
+        ESP_LOGW(TAG, "speaker unavailable; tones and TTS playback disabled");
     }
 
     static SttClient stt(settings, mqtt);
@@ -273,10 +295,14 @@ extern "C" void app_main(void) {
     static VoicePipeline voice(settings, mqtt, stt);
     voice.start();
 
+    static TtsClient tts(settings, mqtt);
+    tts.start();
+    app.tts = &tts;
+
     // Web server: /healthz, /reset, /set_hostname plus /firmware, /config,
-    // /config/reset.
+    // /config/reset, /say.
     static WebContext webctx(&wifi);
-    static VoiceWebServer web(&webctx, settings);
+    static VoiceWebServer web(&webctx, settings, tts);
     web.start();
 
     xTaskCreate(otaVerifyTask, "ota_verify", 4096, nullptr, 4, nullptr);

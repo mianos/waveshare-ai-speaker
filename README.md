@@ -26,8 +26,11 @@ Part of the mianos ESP family; shares the `wifimanager`, `mqttwrapper`,
 - **ESP32-S3**, **16 MB flash**, **Octal PSRAM @80 MHz** (required — esp-sr's AFE
   and the capture buffer live in PSRAM).
 - **ES7210** 4-mic ADC on I²C (SDA 11 / SCL 10) + I²S_NUM_1 (MCLK 12, BCLK 13,
-  WS 14, DIN 15). The ES8311 speaker and SD card on the board are unused.
-- **TCA9555** I/O expander gates board power/PA.
+  WS 14, DIN 15). **ES8311** speaker DAC on the same shared I²S bus (DOUT 16),
+  used for tone cues and TTS playback. The SD card on the board is unused.
+- **TCA9555** I/O expander gates board power/PA (including the speaker amp).
+- **WS2812 RGB LED strip** (GPIO 38) — lights green while a wakeword is being
+  captured.
 
 > ⚠️ If the board turns out to have **Quad** (not Octal) PSRAM, boot will fail to
 > map SPIRAM. Swap `CONFIG_SPIRAM_MODE_OCT` for `CONFIG_SPIRAM_MODE_QUAD` in
@@ -68,23 +71,44 @@ curl http://<ip>/config            # read current settings
 | `vad_silence_ms` | `700`                     | stop capture after this much continuous silence |
 | `max_capture_ms` | `8000`                    | hard cap on one utterance                      |
 | `publish_wake` | `1`                         | publish `tele/<name>/wake` on each trigger     |
-| `play_tone`    | `1`                         | bring up the ES8311 speaker and play start / connected / wake tones (set 0 to disable) |
+| `play_tone`    | `1`                         | play start / connected / wake tone cues (set 0 to disable; the ES8311 itself is always brought up — see below) |
+| `tts_url`      | `http://docker-host.mianos.com:8880/v1/audio/speech?sample_rate=16000` | FastKoko (Kokoro-FastAPI) speech endpoint for the `say` command |
+| `tts_voice`    | `af_heart`                  | default voice; overridable per `say` call      |
 | `mqtt_server`, `mqtt_port`, `sensor_name`, `tz` | mianos house defaults | broker / device identity |
 
 **`stt_url` is empty by default and the device fails fast** (logs + publishes
 `tele/<name>/stterror`) until you set it — nothing is hard-coded.
 
-**Speaker tones** (`play_tone`, default on): a two-note chime at boot, a
-three-note chime on first Wi-Fi connect, and a short blip on each wakeword,
-via the on-board ES8311. Wakeword capture is also shown on the RGB LED (green
-while capturing). The DAC is
-brought up separately from the mic init and is non-fatal — if the ES8311 can't
-be opened it logs and the mic/MQTT path is unaffected. Set `play_tone` to `0`
-to skip the ES8311 entirely (boot path then identical to the mic-only firmware):
+**Speaker output.** The ES8311 DAC is brought up once at boot, independent of
+the mic init and non-fatal — if it can't be opened it logs and the mic/MQTT
+path is unaffected (`play_tone`/`say` then just no-op). Two things use it:
 
-```
-mosquitto_pub -t 'cmnd/wsvoice/settings' -m '{"play_tone":0}'
-```
+- **Tone cues** (`play_tone`, default on): a two-note chime at boot, a
+  three-note chime on first Wi-Fi connect, and a short blip on each wakeword.
+  Wakeword capture is also shown on the RGB LED (green while capturing). Set
+  `play_tone` to `0` to disable the cues (the DAC still comes up for `say`):
+  ```
+  mosquitto_pub -t 'cmnd/wsvoice/settings' -m '{"play_tone":0}'
+  ```
+- **`say` (TTS)** — speak arbitrary text via a FastKoko (Kokoro-FastAPI)
+  server, over MQTT or HTTP:
+  ```
+  mosquitto_pub -t 'cmnd/wsvoice/say' -m '{"text":"hello there","voice":"af_heart"}'
+  curl -X POST -d '{"text":"hello there"}' http://<ip>/say
+  ```
+  `voice` is optional (falls back to `tts_voice`). The device requests
+  `response_format=pcm` — raw 16-bit samples, no container, no on-device
+  decoding — and relies on the server to deliver audio already resampled to
+  16 kHz mono via the `?sample_rate=16000` query param (a FastKoko extension;
+  stock Kokoro-FastAPI is fixed at 24 kHz and can't do this itself). This
+  matches the board's fixed 16 kHz shared I²S clock (mic + speaker on the same
+  bus), so no resampling happens in firmware. A single utterance is capped at
+  15 s of audio; a longer response is played up to the cap and logged as
+  truncated.
+
+Both features share one playback path (`bsp_audio_play_mono16`, serialised by
+a mutex so a tone cue and a `say` can't collide) and publish `tele/<name>/tts`
+/ `tele/<name>/ttserror` on completion/failure (see below).
 
 The STT request is `multipart/form-data` with a `file` part (16-bit mono WAV),
 `model` and optional `language` — compatible with faster-whisper-server,
@@ -92,7 +116,7 @@ speaches, whisper.cpp's server and the OpenAI `/v1/audio/transcriptions` API.
 
 ## MQTT topics
 
-Commands (`cmnd/<name>/…`): `settings`, `restart`, `reprovision`.
+Commands (`cmnd/<name>/…`): `settings`, `say`, `restart`, `reprovision`.
 Telemetry (`tele/<name>/…`):
 
 | topic       | payload                                        |
@@ -100,20 +124,23 @@ Telemetry (`tele/<name>/…`):
 | `wake`      | `{"event":"wake"}` (each wakeword)             |
 | `stt`       | `{"text":…, "ms":…, "stt_ms":…}` (transcript; `stt_ms` = round-trip latency) |
 | `stterror`  | `{"error":…, …}` (unset URL, HTTP error, bad response) |
+| `tts`       | `{"text":…, "ms":…, "tts_ms":…}` (speech played; `tts_ms` = round-trip latency) |
+| `ttserror`  | `{"error":…, …}` (unset URL, HTTP error, empty response, speaker unavailable) |
 | `init`      | version / build / ip, once on connect          |
 | `status`    | uptime, heap, psram every 60 s                  |
 
 ## Web endpoints
 
 `GET /healthz`, `POST /reset`, `POST /set_hostname` (mianos base) plus
-`GET|POST /config`, `POST /config/reset`, `GET|POST /firmware` (raw-body OTA to
-the inactive slot; verified after reconnect, else rolled back).
+`GET|POST /config`, `POST /config/reset`, `POST /say`, `GET|POST /firmware`
+(raw-body OTA to the inactive slot; verified after reconnect, else rolled back).
 
 ## Tests
 
 `test/host/` holds pure host unit tests for the WAV + multipart wire builders
-(`main/SttWire.h`) — the only host-testable units; the esp-sr / I²S / codec path
-is verified on hardware.
+(`main/SttWire.h`), the FastKoko request builder (`main/TtsRequest.h`), and the
+tone synthesis (`main/ToneGen.h`) — the only host-testable units; the esp-sr /
+I²S / codec path is verified on hardware.
 
 ```sh
 bash test/host/run.sh
@@ -135,3 +162,5 @@ CI (`.gitlab-ci.yml`) runs those tests then builds the firmware under
    unset you get a `tele/wsvoice/stterror` (`stt_url_unset`) — the fail-fast.
 5. Set `stt_url` (above) and repeat → `tele/wsvoice/stt {"text": …}` appears.
    Subscribe Node-RED to `tele/wsvoice/stt`.
+6. `mosquitto_pub -t 'cmnd/wsvoice/say' -m '{"text":"testing one two three"}'`
+   → the board speaks it and `tele/wsvoice/tts` appears.

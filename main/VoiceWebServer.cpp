@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 
 #include "Settings.h"
+#include "TtsClient.h"
 #include "WifiManager.h"
 
 namespace {
@@ -46,8 +47,8 @@ esp_err_t send_json(httpd_req_t* req, const JsonWrapper& json) {
 
 }  // namespace
 
-VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings)
-    : WebServer(ctx), settings_(settings) {}
+VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts)
+    : WebServer(ctx), settings_(settings), tts_(tts) {}
 
 esp_err_t VoiceWebServer::start() {
     esp_err_t r = WebServer::start();
@@ -58,12 +59,13 @@ esp_err_t VoiceWebServer::start() {
         httpd_method_t method;
         esp_err_t (*handler)(httpd_req_t*);
     };
-    const std::array<Route, 5> routes = {{
+    const std::array<Route, 6> routes = {{
         {"/firmware",     HTTP_POST, firmware_post_handler},
         {"/firmware",     HTTP_GET,  firmware_get_handler},
         {"/config",       HTTP_GET,  config_get_handler},
         {"/config",       HTTP_POST, config_post_handler},
         {"/config/reset", HTTP_POST, config_reset_post_handler},
+        {"/say",          HTTP_POST, say_post_handler},
     }};
 
     for (const Route& route : routes) {
@@ -215,4 +217,27 @@ esp_err_t VoiceWebServer::config_reset_post_handler(httpd_req_t* req) {
         self->webContext->wifiManager->clear();
     }
     return r;
+}
+
+// POST /say — {"text":"...", "voice":"..."} (voice optional, falls back to
+// Settings::ttsVoice). Enqueues onto the TTS worker and returns immediately;
+// mirrors the "say" MQTT command.
+esp_err_t VoiceWebServer::say_post_handler(httpd_req_t* req) {
+    VoiceWebServer* self = static_cast<VoiceWebServer*>(req->user_ctx);
+    if (req->content_len > kMaxJsonBodyBytes) return sendJsonError(req, 413, "request body too large");
+    std::string body = read_request_body(req);
+    if (body.empty()) return sendJsonError(req, 400, "empty body");
+    JsonWrapper json = JsonWrapper::Parse(body);
+    if (json.Empty()) return sendJsonError(req, 400, "invalid JSON");
+
+    std::string text, voice;
+    if (!json.GetField("text", text) || text.empty()) {
+        return sendJsonError(req, 400, "missing 'text'");
+    }
+    json.GetField("voice", voice);
+
+    bool queued = self->tts_.speak(text, voice);
+    JsonWrapper resp;
+    resp.AddItem("status", std::string(queued ? "queued" : "dropped_queue_full"));
+    return send_json(req, resp);
 }

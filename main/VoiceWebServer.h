@@ -7,6 +7,7 @@
 #include "WebServer.h"
 
 struct Settings;
+class TtsClient;
 
 // ws-voice HTTP control surface, layered on the shared WebServer base
 // (/reset, /set_hostname, /healthz). Adds:
@@ -15,10 +16,11 @@ struct Settings;
 //   GET  /config         current settings as JSON
 //   POST /config         apply + persist a subset of settings
 //   POST /config/reset   restore settings to defaults (optional wifi wipe)
+//   POST /say            {"text":"...", "voice":"..."} -> speak via TTS
 // Handlers recover this instance from req->user_ctx.
 class VoiceWebServer : public WebServer {
 public:
-    VoiceWebServer(WebContext* ctx, Settings& settings);
+    VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts);
 
     esp_err_t start() override;
 
@@ -31,6 +33,8 @@ private:
     static esp_err_t config_get_handler(httpd_req_t* req);
     static esp_err_t config_post_handler(httpd_req_t* req);
     static esp_err_t config_reset_post_handler(httpd_req_t* req);
+    static esp_err_t say_post_handler(httpd_req_t* req);
 
-    Settings& settings_;
+    Settings&  settings_;
+    TtsClient& tts_;
 };

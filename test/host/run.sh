@@ -18,3 +18,10 @@ g++ -std=c++17 -Wall -Wextra \
     -o "$OUT/test_tonegen"
 
 "$OUT/test_tonegen"
+
+g++ -std=c++17 -Wall -Wextra \
+    -I"$ROOT/main" \
+    "$HERE/test_tts_request.cpp" \
+    -o "$OUT/test_tts_request"
+
+"$OUT/test_tts_request"
