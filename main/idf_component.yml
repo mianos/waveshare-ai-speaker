@@ -29,5 +29,5 @@ dependencies:
   # main.cpp builds the esp_mqtt_client config directly.
   espressif/mqtt: "*"
 
-  # On-device wakeword + AFE (WakeNet "Hi ESP", WebRTC VAD).
+  # On-device wakeword + AFE (WakeNet "Computer", WebRTC VAD).
   espressif/esp-sr: ^2.1.5

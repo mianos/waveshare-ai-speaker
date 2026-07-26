@@ -22,6 +22,15 @@ extern "C" {
 // before starting the esp-sr feed task.
 esp_err_t bsp_board_init(void);
 
+// Set the ES7210's analog mic PGA gain (dB, all 4 channels) — the actual
+// hardware pickup level, distinct from any software gain applied later in the
+// AFE pipeline. The codec quantises to its supported steps (0-37.5dB in
+// roughly 3dB steps up to 30dB, then 30/34.5/36/37.5). Safe to call at any
+// time after bsp_board_init() succeeds — it's a live I2C register write, no
+// I2S/AFE re-init needed. No-op returning ESP_ERR_INVALID_STATE if the mic
+// hasn't been brought up.
+esp_err_t bsp_mic_set_gain(float db);
+
 // Bring up the ES8311 speaker DAC for tone playback. Best-effort and INDEPENDENT
 // of bsp_board_init(): call it after bsp_board_init() and before the mic feed
 // task starts. Never aborts the caller — returns an error (logged) if the DAC is

@@ -25,3 +25,10 @@ g++ -std=c++17 -Wall -Wextra \
     -o "$OUT/test_tts_request"
 
 "$OUT/test_tts_request"
+
+g++ -std=c++17 -Wall -Wextra \
+    -I"$ROOT/main" \
+    "$HERE/test_miclevel.cpp" \
+    -o "$OUT/test_miclevel"
+
+"$OUT/test_miclevel"

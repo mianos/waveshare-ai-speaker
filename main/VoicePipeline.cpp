@@ -1,5 +1,7 @@
 #include "VoicePipeline.h"
 
+#include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
@@ -18,6 +20,7 @@
 
 #include "board.h"
 #include "JsonWrapper.h"
+#include "MicLevel.h"
 #include "MqttClient.h"
 #include "Settings.h"
 #include "SttClient.h"
@@ -33,19 +36,60 @@ constexpr uint32_t kSamplesPerMs  = kSampleRate / 1000;  // 16
 const esp_afe_sr_iface_t* s_afe      = nullptr;  // esp_afe_handle_from_config returns const
 esp_afe_sr_data_t*        s_afe_data = nullptr;
 srmodel_list_t*           s_models   = nullptr;
+
+// Applies the near-field mic array tuning settings on top of esp-sr's own
+// input-format-derived defaults. -1 fields are left untouched; only the
+// gain is unconditionally set (100 = 1.00x is a no-op).
+void applyAfeTuning(afe_config_t* cfg, Settings& settings) {
+    if (settings.wakenetMode >= 0 && settings.wakenetMode <= DET_MODE_90_COPY_PARAMS) {
+        cfg->wakenet_mode = (det_mode_t)settings.wakenetMode;
+    } else if (settings.wakenetMode != -1) {
+        ESP_LOGW(TAG, "wakenet_mode %d out of range [0,6]; keeping default", settings.wakenetMode);
+    }
+    if (settings.vadMode >= VAD_MODE_0 && settings.vadMode <= VAD_MODE_4) {
+        cfg->vad_mode = (vad_mode_t)settings.vadMode;
+    } else if (settings.vadMode != -1) {
+        ESP_LOGW(TAG, "vad_mode %d out of range [0,4]; keeping default", settings.vadMode);
+    }
+    if (settings.agcTargetDbfs != -1) {
+        cfg->agc_target_level_dbfs = settings.agcTargetDbfs;
+    }
+    if (settings.agcCompressionDb != -1) {
+        cfg->agc_compression_gain_db = settings.agcCompressionDb;
+    }
+    int gainX100 = settings.micGainX100;
+    if (gainX100 < 10 || gainX100 > 1000) {
+        ESP_LOGW(TAG, "mic_gain_x100 %d out of range [10,1000]; using 100", gainX100);
+        gainX100 = 100;
+    }
+    cfg->afe_linear_gain = gainX100 / 100.0f;
+
+    ESP_LOGI(TAG, "afe tuning: wakenet_mode=%d vad_mode=%d agc_target_dbfs=%d "
+                  "agc_compression_db=%d linear_gain=%.2f",
+             (int)cfg->wakenet_mode, (int)cfg->vad_mode, cfg->agc_target_level_dbfs,
+             cfg->agc_compression_gain_db, cfg->afe_linear_gain);
+}
+
 }  // namespace
 
 VoicePipeline::VoicePipeline(Settings& settings, MqttClient& mqtt, SttClient& stt)
     : settings_(settings), mqtt_(mqtt), stt_(stt) {}
 
 void VoicePipeline::start() {
+    levelMutex_ = xSemaphoreCreateMutex();
+
     s_models = esp_srmodel_init("model");  // SPIFFS partition label in partitions.csv
     afe_config_t* cfg = afe_config_init(esp_get_input_format(), s_models,
                                         AFE_TYPE_SR, AFE_MODE_LOW_COST);
     cfg->ns_init  = true;   // noise suppression — cleaner audio for the STT server
     cfg->vad_init = true;   // VAD drives end-of-utterance detection
-    // wakenet stays enabled (WN9 "Hi ESP" from sdkconfig); MultiNet is disabled
+    // wakenet stays enabled (WN9 "Computer" from sdkconfig); MultiNet is disabled
     // in sdkconfig, so no command model is loaded.
+    applyAfeTuning(cfg, settings_);
+
+    micNum_ = std::min(cfg->pcm_config.mic_num, kMaxMicChannels);
+    for (int i = 0; i < micNum_; ++i) micIds_[i] = cfg->pcm_config.mic_ids[i];
+
     s_afe = esp_afe_handle_from_config(cfg);
     s_afe_data = s_afe->create_from_config(cfg);
     afe_config_free(cfg);
@@ -55,7 +99,7 @@ void VoicePipeline::start() {
     xTaskCreate(toneTrampoline, "vp_tone", 4 * 1024, this, 4, &toneTaskHandle_);
     xTaskCreatePinnedToCore(captureTrampoline, "vp_detect", 8 * 1024, this, 5, nullptr, 1);
     xTaskCreatePinnedToCore(feedTrampoline,    "vp_feed",   8 * 1024, this, 5, nullptr, 0);
-    ESP_LOGI(TAG, "voice pipeline started (wakeword 'Hi ESP')");
+    ESP_LOGI(TAG, "voice pipeline started (wakeword 'Computer')");
 }
 
 void VoicePipeline::feedTrampoline(void* arg)    { static_cast<VoicePipeline*>(arg)->feedTask(); }
@@ -111,6 +155,22 @@ void VoicePipeline::feedTask() {
     esp_task_wdt_add(NULL);
     for (;;) {
         esp_get_feed_data(true, i2s_buf, buf_bytes);
+
+        // Feed this chunk into the running per-mic level accumulators, but
+        // only while captureTask has a capture in progress (see there) — a
+        // level sampled on a free-running timer mostly shows ambient noise
+        // between events, not anything about the recording it's meant to
+        // characterise.
+        if (settings_.micLevelLog && micNum_ > 0) {
+            xSemaphoreTake(levelMutex_, portMAX_DELAY);
+            if (levelActive_) {
+                for (int m = 0; m < micNum_; ++m) {
+                    miclevel::accumulate(levelAccum_[m], i2s_buf, audio_chunksize, feed_channel, micIds_[m]);
+                }
+            }
+            xSemaphoreGive(levelMutex_);
+        }
+
         s_afe->feed(s_afe_data, i2s_buf);
         esp_task_wdt_reset();
     }
@@ -162,6 +222,13 @@ void VoicePipeline::captureTask() {
             s_afe->disable_wakenet(s_afe_data);  // don't re-trigger mid-utterance
             ESP_LOGI(TAG, "wake: capturing");
             bsp_led_set(0, 40, 0);  // green while listening/capturing
+
+            if (settings_.micLevelLog) {
+                xSemaphoreTake(levelMutex_, portMAX_DELAY);
+                for (int m = 0; m < micNum_; ++m) levelAccum_[m] = miclevel::ChannelAccum{};
+                levelActive_ = true;
+                xSemaphoreGive(levelMutex_);
+            }
             if (settings_.playTone && toneTaskHandle_) {
                 xTaskNotifyGive(toneTaskHandle_);  // blip, played off this task
             }
@@ -193,6 +260,22 @@ void VoicePipeline::captureTask() {
                 capturing = false;
                 s_afe->enable_wakenet(s_afe_data);  // re-arm
                 bsp_led_set(0, 0, 0);  // off when capture ends
+
+                if (settings_.micLevelLog && micNum_ > 0) {
+                    miclevel::ChannelLevel lvl[kMaxMicChannels];
+                    xSemaphoreTake(levelMutex_, portMAX_DELAY);
+                    levelActive_ = false;
+                    for (int m = 0; m < micNum_; ++m) lvl[m] = miclevel::finishLevel(levelAccum_[m]);
+                    xSemaphoreGive(levelMutex_);
+
+                    char line[160];
+                    int  off = 0;
+                    for (int m = 0; m < micNum_; ++m) {
+                        off += std::snprintf(line + off, sizeof(line) - off,
+                            "%smic%d rms=%.1fdB peak=%.1fdB", m ? "  " : "", m, lvl[m].rmsDb, lvl[m].peakDb);
+                    }
+                    ESP_LOGI(TAG, "capture levels (%ums): %s", totalMs, line);
+                }
 
                 if (sawSpeech && capSamples > 0) {
                     const uint32_t capMs = (uint32_t)capSamples / kSamplesPerMs;

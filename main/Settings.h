@@ -36,6 +36,36 @@ struct Settings : SettingsBase {
     int vadSilenceMs     = 700;    // stop after this much continuous silence
     int maxCaptureMs     = 8000;   // hard cap on a single utterance
     int publishWakeEvent = 1;      // 1 ⇒ publish tele/<name>/wake on trigger
+
+    // esp-sr AFE / near-field mic array tuning. -1 on any of the mode/level
+    // fields means "leave esp-sr's own default for this hardware/input format
+    // alone" — only a non-negative value is applied to the AFE config, so an
+    // untouched install behaves exactly as before this setting existed.
+    // wakenet_mode: det_mode_t — 0=90% normal, 1=95% aggressive, 2/3=2-channel
+    // 90%/95% (this board has a 2-mic array), 4/5=3-channel. Higher = more
+    // sensitive trigger, more false alarms.
+    int wakenetMode      = -1;
+    // vad_mode: vad_mode_t 0-4 (0=normal .. 4=very very very aggressive). A
+    // *lower* mode reports speech more readily (good for a quiet/near-field
+    // mic); higher rejects more as noise.
+    int vadMode          = -1;
+    // agc_target_level_dbfs: AGC target envelope, in -dBFS (esp-sr default 3).
+    int agcTargetDbfs    = -1;
+    // agc_compression_gain_db: fixed digital gain applied by AGC (default 9).
+    int agcCompressionDb = -1;
+    // afe_linear_gain: extra output gain multiplier, x100 (100 = 1.00x, valid
+    // range 10-1000 = 0.1x-10x). Always applied (100 is a no-op). This is a
+    // software multiplier on the AFE's already-processed *output* — it does
+    // not improve pickup SNR (see mic_hw_gain_db for the actual hardware gain).
+    int micGainX100      = 100;
+    // ES7210 analog mic PGA gain, in dB (the real hardware pickup level,
+    // applied at the ADC before any AFE processing). The codec quantises to
+    // its own supported steps (0-37.5dB); see bsp_mic_set_gain(). Matches the
+    // vendor demo's default of 30dB.
+    int micHwGainDb      = 30;
+    // 1 ⇒ log each mic channel's RMS/peak level (dBFS) for every wake
+    // capture, to help aim/position the near-field array and pick a gain.
+    int micLevelLog      = 0;
     // Speaker tones (start + connected). ES8311 bring-up is non-fatal and runs
     // after (never inside) the mic init, so a DAC failure can't stop the voice
     // path — hence this is on by default. Set 0 to skip the ES8311 entirely
@@ -56,6 +86,13 @@ struct Settings : SettingsBase {
         field("max_capture_ms", maxCaptureMs);
         field("publish_wake",   publishWakeEvent);
         field("play_tone",      playTone);
+        field("wakenet_mode",      wakenetMode);
+        field("vad_mode",          vadMode);
+        field("agc_target_dbfs",   agcTargetDbfs);
+        field("agc_compression_db", agcCompressionDb);
+        field("mic_gain_x100",     micGainX100);
+        field("mic_hw_gain_db",    micHwGainDb);
+        field("mic_level_log",     micLevelLog);
         load();
     }
 };

@@ -1,6 +1,6 @@
 // ws-voice — Waveshare ESP32-S3 audio board voice → MQTT bridge.
 //
-// On the "Hi ESP" wakeword (on-device esp-sr WakeNet) it records the following
+// On the "Computer" wakeword (on-device esp-sr WakeNet) it records the following
 // speech (AFE-enhanced 16 kHz mono, ended by VAD silence or a max cap), POSTs
 // the audio to a configurable Whisper-style STT server, and publishes the
 // transcript to MQTT for Node-RED to act on. Shares its infrastructure
@@ -9,11 +9,13 @@
 //
 // The ES8311 speaker (independent of the mic, always brought up best-effort —
 // see bsp_audio_out_init) plays a short chime at boot, on first Wi-Fi connect,
-// and a blip on each wakeword (all gated on play_tone, default on), plus
-// on-demand speech via the "say" command (FastKoko/Kokoro-FastAPI TTS, see
-// tts_url). DAC bring-up is non-fatal, so audio failures can never stall boot
-// or take down the mic/MQTT path. The on-board RGB LED lights green while a
-// wakeword is being captured.
+// and a blip on each wakeword (all gated on play_tone, default on); once MQTT
+// actually connects (not just Wi-Fi — the broker may be unreachable even with
+// an IP) it also speaks "Connected" via TTS. Plus on-demand speech via the
+// "say" command (FastKoko/Kokoro-FastAPI TTS, see tts_url). DAC bring-up is
+// non-fatal, so audio failures can never stall boot or take down the
+// mic/MQTT path. The on-board RGB LED lights green while a wakeword is being
+// captured.
 //
 // MQTT (cmnd/<name>/...):
 //   settings    any subset of the /config JSON (e.g. {"stt_url": "..."})
@@ -104,6 +106,20 @@ struct App {
     WiFiManager* wifi;
     TtsClient*   tts = nullptr;  // set once constructed, later in app_main
 };
+
+// Wi-Fi getting an IP doesn't mean the broker is actually reachable (auth
+// failure, firewalled port, broker down) — wait_for_connection() blocks on
+// the real MQTT_EVENT_CONNECTED, so speaking "Connected" here confirms the
+// whole pipeline is up, not just the network link.
+void mqttConnectedSpeechTask(void* arg) {
+    auto* app = static_cast<App*>(arg);
+    app->mqtt->wait_for_connection();
+    if (app->settings->playTone && app->tts) {
+        ESP_LOGI(TAG, "mqtt connected; saying 'Connected'");
+        app->tts->speak("Connected");
+    }
+    vTaskDelete(nullptr);
+}
 
 std::string uptimeString() {
     uint32_t seconds = (uint32_t)(esp_timer_get_time() / 1000000ULL);
@@ -269,6 +285,16 @@ extern "C" void app_main(void) {
     // wake/capture pipeline that feeds it.
     ESP_ERROR_CHECK(bsp_board_init());
 
+    // Override the ES7210's compiled-in default mic PGA gain with the
+    // configured value, if it differs. A live I2C register write — no re-init
+    // needed — so this is safe to do unconditionally right after board bring-up.
+    if (settings.micHwGainDb < 0 || settings.micHwGainDb > 38) {
+        ESP_LOGW(TAG, "mic_hw_gain_db %d out of range [0,38]; leaving board default", settings.micHwGainDb);
+    } else {
+        esp_err_t gainRet = bsp_mic_set_gain((float)settings.micHwGainDb);
+        ESP_LOGI(TAG, "mic hw gain: %d dB -> %s", settings.micHwGainDb, esp_err_to_name(gainRet));
+    }
+
     // On-board RGB LED — independent of the speaker, best-effort (non-fatal).
     // Flashed green by the voice pipeline while a wakeword is being captured.
     bsp_led_init();
@@ -298,6 +324,7 @@ extern "C" void app_main(void) {
     static TtsClient tts(settings, mqtt);
     tts.start();
     app.tts = &tts;
+    xTaskCreate(mqttConnectedSpeechTask, "mqtt_say", 4096, &app, 4, nullptr);
 
     // Web server: /healthz, /reset, /set_hostname plus /firmware, /config,
     // /config/reset, /say.

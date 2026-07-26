@@ -92,6 +92,14 @@ static esp_err_t bsp_i2s_init(void)
     return ret;
 }
 
+// Shared by boot-time bring-up and the runtime bsp_mic_set_gain() setter.
+static void set_all_mic_gain(float db)
+{
+    for (int ch = 0; ch < 4; ++ch) {
+        esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(ch), db);
+    }
+}
+
 static esp_err_t bsp_codec_adc_init(void)
 {
     audio_codec_i2s_cfg_t i2s_cfg = {
@@ -130,10 +138,15 @@ static esp_err_t bsp_codec_adc_init(void)
         .bits_per_sample = 32,
     };
     esp_err_t ret = esp_codec_dev_open(record_dev, &fs);
-    for (int ch = 0; ch < 4; ++ch) {
-        esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(ch), RECORD_VOLUME);
-    }
+    set_all_mic_gain(RECORD_VOLUME);
     return ret;
+}
+
+esp_err_t bsp_mic_set_gain(float db)
+{
+    if (!record_dev) return ESP_ERR_INVALID_STATE;
+    set_all_mic_gain(db);
+    return ESP_OK;
 }
 
 esp_err_t bsp_board_init(void)

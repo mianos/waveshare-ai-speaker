@@ -1,12 +1,12 @@
 # ws-voice
 
 Voice control bridge for a **Waveshare ESP32-S3 audio board**. On the wakeword
-**"Hi ESP"** (detected on-device by esp-sr / WakeNet9) it records the following
+**"Computer"** (detected on-device by esp-sr / WakeNet9) it records the following
 speech, POSTs it to a configurable Whisper-style speech-to-text server, and
 publishes the transcript to MQTT for Node-RED (or anything else) to act on.
 
 ```
-mic (ES7210) ──▶ esp-sr AFE ──▶ WakeNet "Hi ESP" ──▶ capture (VAD-ended)
+mic (ES7210) ──▶ esp-sr AFE ──▶ WakeNet "Computer" ──▶ capture (VAD-ended)
                                                           │
                                     WAV + multipart POST ─┘
                                                           ▼
@@ -74,6 +74,13 @@ curl http://<ip>/config            # read current settings
 | `play_tone`    | `1`                         | play start / connected / wake tone cues (set 0 to disable; the ES8311 itself is always brought up — see below) |
 | `tts_url`      | `http://docker-host.mianos.com:8880/v1/audio/speech?sample_rate=16000` | FastKoko (Kokoro-FastAPI) speech endpoint for the `say` command |
 | `tts_voice`    | `af_heart`                  | default voice; overridable per `say` call      |
+| `wakenet_mode` | `-1` (esp-sr default)       | WakeNet sensitivity: `0`/`1`=90%/95% normal, `2`/`3`=2-channel 90%/95% (this board's array), `4`/`5`=3-channel. Higher = more sensitive, more false triggers |
+| `vad_mode`     | `-1` (esp-sr default)       | VAD aggressiveness `0`-`4` (`0`=normal…`4`=very very very aggressive); *lower* reports speech more readily |
+| `agc_target_dbfs` | `-1` (esp-sr default, `3`) | AGC target envelope in -dBFS |
+| `agc_compression_db` | `-1` (esp-sr default, `9`) | AGC fixed digital compression gain, dB |
+| `mic_gain_x100` | `100`                      | extra linear *output* gain (post-AFE), ×100 (`100`=1.00x, valid `10`-`1000` = 0.1x-10x) — boosts noise along with signal, doesn't improve pickup SNR |
+| `mic_hw_gain_db` | `30`                       | ES7210 analog mic PGA gain in dB, applied at the ADC before any processing (real hardware gain — this is the one that improves pickup at distance); quantised to the codec's supported steps, up to 37.5dB |
+| `mic_level_log` | `0`                        | `1` ⇒ log each mic channel's RMS/peak (dBFS) for each wake capture, for aiming/gaining the array |
 | `mqtt_server`, `mqtt_port`, `sensor_name`, `tz` | mianos house defaults | broker / device identity |
 
 **`stt_url` is empty by default and the device fails fast** (logs + publishes
@@ -85,8 +92,12 @@ path is unaffected (`play_tone`/`say` then just no-op). Two things use it:
 
 - **Tone cues** (`play_tone`, default on): a two-note chime at boot, a
   three-note chime on first Wi-Fi connect, and a short blip on each wakeword.
-  Wakeword capture is also shown on the RGB LED (green while capturing). Set
-  `play_tone` to `0` to disable the cues (the DAC still comes up for `say`):
+  Once MQTT actually connects (a separate, stronger signal than the Wi-Fi
+  chime — the broker can be unreachable even with an IP) it also speaks
+  "Connected" via TTS, using the same `play_tone` gate and `tts_url`/`tts_voice`
+  as `say` below. Wakeword capture is also shown on the RGB LED (green while
+  capturing). Set `play_tone` to `0` to disable all of the cues (the DAC
+  still comes up for `say`):
   ```
   mosquitto_pub -t 'cmnd/wsvoice/settings' -m '{"play_tone":0}'
   ```
@@ -109,6 +120,31 @@ path is unaffected (`play_tone`/`say` then just no-op). Two things use it:
 Both features share one playback path (`bsp_audio_play_mono16`, serialised by
 a mutex so a tone cue and a `say` can't collide) and publish `tele/<name>/tts`
 / `tele/<name>/ttserror` on completion/failure (see below).
+
+**Near-field mic array tuning.** The board's 2-mic array feeds esp-sr's AFE
+(AEC → SE/BSS → NS → VAD → WakeNet). `wakenet_mode`/`vad_mode`/`agc_target_dbfs`/
+`agc_compression_db`/`mic_gain_x100`/`mic_hw_gain_db` (above) tune sensitivity
+and gain without a rebuild — `mic_hw_gain_db` takes effect immediately (a live
+ES7210 register write); the AFE-side settings (`wakenet_mode`, `vad_mode`,
+`agc_*`, `mic_gain_x100`) are baked into the AFE at boot, so those need a
+reboot (`cmnd/<name>/restart`) to apply. The `-1` defaults on the AFE settings
+leave esp-sr's own input-format-derived choices alone. To dial these in, turn
+on the level meter and watch the console while speaking at the mic's normal
+distance/angle:
+```
+mosquitto_pub -t 'cmnd/wsvoice/settings' -m '{"mic_level_log":1}'
+```
+This logs one summary line per wake capture (not on a free-running timer —
+those samples mostly land on ambient noise between events, not the recording
+itself), covering the whole utterance from wake to end-of-speech: `capture
+levels (2310ms): mic0 rms=-22.1dB peak=-8.4dB  mic1 rms=-24.0dB peak=-9.1dB`.
+It's raw mic data (before AFE processing) — useful for checking both mics see
+comparable levels and aren't clipping (peak near 0 dBFS) or too quiet. If it's
+too quiet, raise `mic_hw_gain_db` first (real hardware gain, up to ~37.5dB) —
+`mic_gain_x100`/`agc_target_dbfs` only scale the AFE's already-processed
+*output* and boost noise right along with the signal, so they don't fix a
+genuine pickup/SNR shortfall. Once levels look healthy, tune `wakenet_mode`
+for the false-trigger vs. missed-wake tradeoff.
 
 The STT request is `multipart/form-data` with a `file` part (16-bit mono WAV),
 `model` and optional `language` — compatible with faster-whisper-server,
@@ -138,9 +174,10 @@ Telemetry (`tele/<name>/…`):
 ## Tests
 
 `test/host/` holds pure host unit tests for the WAV + multipart wire builders
-(`main/SttWire.h`), the FastKoko request builder (`main/TtsRequest.h`), and the
-tone synthesis (`main/ToneGen.h`) — the only host-testable units; the esp-sr /
-I²S / codec path is verified on hardware.
+(`main/SttWire.h`), the FastKoko request builder (`main/TtsRequest.h`), the
+tone synthesis (`main/ToneGen.h`), and the mic level meter maths
+(`main/MicLevel.h`) — the only host-testable units; the esp-sr / I²S / codec
+path is verified on hardware.
 
 ```sh
 bash test/host/run.sh
@@ -154,8 +191,8 @@ CI (`.gitlab-ci.yml`) runs those tests then builds the firmware under
 1. `bash test/host/run.sh` — wire builders pass.
 2. `./build.sh && idf.py -b 115200 flash monitor`; first boot provisions Wi-Fi
    via ESP-Touch v2.
-3. Say **"Hi ESP"** (the phrase is fixed by the wn9_hiesp model — nothing else
-   triggers it) → the RGB LED lights green, a short blip plays, the log shows
+3. Say **"Computer"** (the phrase is fixed by the wn9_computer_tts model —
+   nothing else triggers it) → the RGB LED lights green, a short blip plays, the log shows
    the trigger, and `tele/wsvoice/wake` is published. The LED clears when
    capture ends.
 4. Speak a phrase, pause → log shows capture length + VAD stop. With `stt_url`
