@@ -1,6 +1,6 @@
 #include "TtsClient.h"
 
-#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -20,14 +20,29 @@
 namespace {
 constexpr const char* TAG = "tts";
 
-constexpr int    kHttpTimeoutMs = 20000;  // synth + resample can take a few seconds
+constexpr int    kHttpTimeoutMs = 20000;  // stall timeout for a single read, not the whole clip
 constexpr size_t kReadChunk     = 2048;
-// Cap a single utterance's PCM: 15 s @ 16 kHz mono 16-bit. Ample for a spoken
-// prompt; a longer response is played up to this and logged as truncated
-// rather than growing the buffer unbounded.
-constexpr size_t kMaxPcmSamples = 16000 * 15;
-constexpr size_t kMaxPcmBytes   = kMaxPcmSamples * sizeof(int16_t);
+// Backstop only, not a normal-use limit: audio is played incrementally as it
+// downloads (see process()), so length isn't bounded by any buffer size.
+// This just stops a runaway/misbehaving TTS server from streaming forever.
+constexpr size_t kMaxStreamSamples = 16000 * 300;  // 5 min @ 16 kHz mono 16-bit
+constexpr size_t kMaxStreamBytes   = kMaxStreamSamples * sizeof(int16_t);
 constexpr int    kQueueDepth    = 2;
+
+// LED brightness (0-40, matching VoicePipeline's wake-listening green) tracking
+// this chunk's peak amplitude. sqrt compresses the range so quiet speech still
+// shows some pulse instead of only lighting up near full scale.
+constexpr uint8_t kLedMaxBrightness = 40;
+
+uint8_t chunkLedBrightness(const int16_t* pcm, size_t nsamples) {
+    int16_t peak = 0;
+    for (size_t i = 0; i < nsamples; ++i) {
+        int16_t a = pcm[i] < 0 ? (int16_t)(-pcm[i]) : pcm[i];
+        if (a > peak) peak = a;
+    }
+    float level = std::sqrt((float)peak / 32768.0f);
+    return (uint8_t)(level * kLedMaxBrightness);
+}
 
 bool writeAll(esp_http_client_handle_t client, const char* data, size_t len) {
     size_t off = 0;
@@ -61,11 +76,13 @@ bool TtsClient::speak(const std::string& text, const std::string& voice) {
         ESP_LOGW(TAG, "speak() called with empty text");
         return false;
     }
-    TtsJob job{};
-    std::snprintf(job.text, sizeof(job.text), "%s", text.c_str());
-    std::snprintf(job.voice, sizeof(job.voice), "%s", voice.c_str());
+    TtsJob job;
+    job.text  = new std::string(text);
+    job.voice = voice.empty() ? nullptr : new std::string(voice);
     if (!queue_ || xQueueSend(queue_, &job, 0) != pdTRUE) {
         ESP_LOGW(TAG, "job queue full, dropping \"%.40s\"", text.c_str());
+        delete job.text;
+        delete job.voice;
         return false;
     }
     return true;
@@ -80,19 +97,21 @@ void TtsClient::worker() {
         TtsJob job;
         if (xQueueReceive(queue_, &job, portMAX_DELAY) == pdTRUE) {
             process(job);
+            delete job.text;
+            delete job.voice;
         }
     }
 }
 
 void TtsClient::process(const TtsJob& job) {
     const std::string base  = "tele/" + settings_.sensorName + "/";
-    const std::string voice = job.voice[0] ? std::string(job.voice) : settings_.ttsVoice;
+    const std::string voice = job.voice ? *job.voice : settings_.ttsVoice;
 
     // Fail-fast: nothing to POST to yet.
     if (settings_.ttsUrl.empty()) {
         ESP_LOGW(TAG, "tts_url not configured; \"%s\" dropped. "
                       "Set it via cmnd/%s/settings or POST /config.",
-                 job.text, settings_.sensorName.c_str());
+                 job.text->c_str(), settings_.sensorName.c_str());
         JsonWrapper err;
         err.AddItem("error", std::string("tts_url_unset"));
         err.AddTime();
@@ -100,7 +119,7 @@ void TtsClient::process(const TtsJob& job) {
         return;
     }
 
-    const std::string body = tts::requestBody(job.text, voice);
+    const std::string body = tts::requestBody(*job.text, voice);
 
     esp_http_client_config_t cfg = {};
     cfg.url        = settings_.ttsUrl.c_str();
@@ -147,29 +166,70 @@ void TtsClient::process(const TtsJob& job) {
         return;
     }
 
-    int16_t* pcm = (int16_t*)heap_caps_malloc(kMaxPcmBytes, MALLOC_CAP_SPIRAM);
-    if (!pcm) {
-        ESP_LOGE(TAG, "pcm buffer alloc failed (%zu bytes)", kMaxPcmBytes);
+    // Play as it downloads: begin the stream, hand each HTTP chunk straight to
+    // the codec, end the stream. Length is bounded only by kMaxStreamBytes (a
+    // backstop against a runaway server), not by any pre-sized buffer.
+    esp_err_t streamErr = bsp_audio_stream_begin();
+    const bool canPlay = (streamErr == ESP_OK);
+
+    // Small read buffer, off the "tts" task's 6 KB stack (it's shared with the
+    // HTTP client's own working set) -- unlike the old whole-clip buffer, this
+    // one is tiny, so a plain internal-RAM alloc is fine (no need for PSRAM).
+    uint8_t* buf = (uint8_t*)heap_caps_malloc(kReadChunk + 1, MALLOC_CAP_8BIT);
+    if (!buf) {
+        ESP_LOGE(TAG, "tts read buffer alloc failed (%zu bytes)", kReadChunk + 1);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
+        if (canPlay) bsp_audio_stream_end();
         return;
     }
-    size_t total = 0;
-    while (total < kMaxPcmBytes) {
-        int r = esp_http_client_read(client, reinterpret_cast<char*>(pcm) + total,
-                                      (int)std::min(kReadChunk, kMaxPcmBytes - total));
+    size_t carry      = 0;  // 0 or 1 leftover byte at buf[0] from the previous read
+    size_t totalBytes = 0;
+    bool   playFailed = false;
+
+    for (;;) {
+        if (totalBytes >= kMaxStreamBytes) {
+            ESP_LOGW(TAG, "TTS stream exceeded %zu bytes (%us backstop); stopping",
+                     kMaxStreamBytes, (unsigned)(kMaxStreamSamples / 16000));
+            break;
+        }
+        int r = esp_http_client_read(client, reinterpret_cast<char*>(buf) + carry, (int)kReadChunk);
         if (r <= 0) break;
-        total += (size_t)r;
+        totalBytes += (size_t)r;
+
+        const size_t avail       = carry + (size_t)r;
+        const size_t sampleBytes = avail & ~size_t(1);  // whole int16 samples only
+        const size_t samples     = sampleBytes / sizeof(int16_t);
+
+        if (canPlay && !playFailed && samples > 0) {
+            const int16_t* samplePcm = reinterpret_cast<int16_t*>(buf);
+            uint8_t brightness = chunkLedBrightness(samplePcm, samples);
+            bsp_led_set(0, 0, brightness);
+
+            esp_err_t playRet = bsp_audio_stream_write(samplePcm, samples);
+            if (playRet != ESP_OK) {
+                ESP_LOGW(TAG, "TTS stream write failed: %s", esp_err_to_name(playRet));
+                playFailed = true;
+            }
+        }
+
+        carry = avail - sampleBytes;
+        if (carry) buf[0] = buf[sampleBytes];
     }
-    const bool truncated = (total >= kMaxPcmBytes);
+    heap_caps_free(buf);
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
+    if (canPlay) {
+        bsp_audio_stream_end();
+        bsp_led_set(0, 0, 0);
+    }
 
-    const uint32_t ttsMs = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    const uint32_t ttsMs   = (uint32_t)((esp_timer_get_time() - t0) / 1000);
+    const size_t   samples = totalBytes / sizeof(int16_t);
+    const uint32_t audioMs = (uint32_t)(samples / 16);  // 16 samples/ms at 16 kHz
 
-    if (total < sizeof(int16_t)) {
+    if (totalBytes < sizeof(int16_t)) {
         ESP_LOGW(TAG, "TTS returned no audio (%ums)", ttsMs);
-        heap_caps_free(pcm);
         JsonWrapper e;
         e.AddItem("error", std::string("empty_response"));
         e.AddItem("tts_ms", (int)ttsMs);
@@ -177,20 +237,9 @@ void TtsClient::process(const TtsJob& job) {
         mqtt_.publish(base + "ttserror", e.ToString());
         return;
     }
-    if (truncated) {
-        ESP_LOGW(TAG, "TTS response exceeded %zu bytes (%us cap); playback truncated",
-                 kMaxPcmBytes, (unsigned)(kMaxPcmSamples / 16000));
-    }
-
-    const size_t   samples = total / sizeof(int16_t);
-    const uint32_t audioMs = (uint32_t)(samples / 16);  // 16 samples/ms at 16 kHz
-
-    esp_err_t playRet = bsp_audio_play_mono16(pcm, samples);
-    heap_caps_free(pcm);
-
-    if (playRet != ESP_OK) {
+    if (!canPlay) {
         ESP_LOGW(TAG, "TTS synthesised %ums audio but speaker unavailable: %s",
-                 audioMs, esp_err_to_name(playRet));
+                 audioMs, esp_err_to_name(streamErr));
         JsonWrapper e;
         e.AddItem("error", std::string("speaker_unavailable"));
         e.AddItem("tts_ms", (int)ttsMs);
@@ -198,10 +247,19 @@ void TtsClient::process(const TtsJob& job) {
         mqtt_.publish(base + "ttserror", e.ToString());
         return;
     }
+    if (playFailed) {
+        ESP_LOGW(TAG, "TTS playback failed partway (%ums synthesised)", audioMs);
+        JsonWrapper e;
+        e.AddItem("error", std::string("playback_failed"));
+        e.AddItem("tts_ms", (int)ttsMs);
+        e.AddTime();
+        mqtt_.publish(base + "ttserror", e.ToString());
+        return;
+    }
 
-    ESP_LOGI(TAG, "TTS \"%s\" (%ums audio, %ums http)", job.text, audioMs, ttsMs);
+    ESP_LOGI(TAG, "TTS \"%s\" (%ums audio, %ums http)", job.text->c_str(), audioMs, ttsMs);
     JsonWrapper out;
-    out.AddItem("text", std::string(job.text));
+    out.AddItem("text", *job.text);
     out.AddItem("ms", (int)audioMs);
     out.AddItem("tts_ms", (int)ttsMs);
     out.AddTime();

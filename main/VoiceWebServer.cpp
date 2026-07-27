@@ -59,13 +59,15 @@ esp_err_t VoiceWebServer::start() {
         httpd_method_t method;
         esp_err_t (*handler)(httpd_req_t*);
     };
-    const std::array<Route, 6> routes = {{
+    const std::array<Route, 8> routes = {{
         {"/firmware",     HTTP_POST, firmware_post_handler},
         {"/firmware",     HTTP_GET,  firmware_get_handler},
         {"/config",       HTTP_GET,  config_get_handler},
         {"/config",       HTTP_POST, config_post_handler},
         {"/config/reset", HTTP_POST, config_reset_post_handler},
         {"/say",          HTTP_POST, say_post_handler},
+        {"/volume",       HTTP_GET,  volume_get_handler},
+        {"/volume",       HTTP_POST, volume_post_handler},
     }};
 
     for (const Route& route : routes) {
@@ -239,5 +241,36 @@ esp_err_t VoiceWebServer::say_post_handler(httpd_req_t* req) {
     bool queued = self->tts_.speak(text, voice);
     JsonWrapper resp;
     resp.AddItem("status", std::string(queued ? "queued" : "dropped_queue_full"));
+    return send_json(req, resp);
+}
+
+esp_err_t VoiceWebServer::volume_get_handler(httpd_req_t* req) {
+    VoiceWebServer* self = static_cast<VoiceWebServer*>(req->user_ctx);
+    JsonWrapper resp;
+    resp.AddItem("volume", self->settings_.speakerVolume);
+    return send_json(req, resp);
+}
+
+// POST /volume — {"volume": 0-100}. A thin wrapper around the same
+// loadFromJson()/onChange machinery as /config, just under a shorter,
+// dedicated key/path for a value that's tweaked often and applies live.
+esp_err_t VoiceWebServer::volume_post_handler(httpd_req_t* req) {
+    VoiceWebServer* self = static_cast<VoiceWebServer*>(req->user_ctx);
+    if (req->content_len > kMaxJsonBodyBytes) return sendJsonError(req, 413, "request body too large");
+    std::string body = read_request_body(req);
+    if (body.empty()) return sendJsonError(req, 400, "empty body");
+    JsonWrapper json = JsonWrapper::Parse(body);
+    if (json.Empty()) return sendJsonError(req, 400, "invalid JSON");
+
+    int vol = 0;
+    if (!json.GetField("volume", vol)) return sendJsonError(req, 400, "missing 'volume'");
+
+    JsonWrapper doc;
+    doc.AddItem("speaker_volume", vol);
+    self->settings_.loadFromJson(doc);
+    self->settings_.save();
+
+    JsonWrapper resp;
+    resp.AddItem("volume", self->settings_.speakerVolume);
     return send_json(req, resp);
 }

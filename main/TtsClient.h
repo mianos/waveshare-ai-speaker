@@ -8,11 +8,13 @@
 struct Settings;
 class MqttClient;
 
-// One "speak this" request. Fixed-size buffers (mirroring mianesp's
-// AudioPlayer::PlayRequest) avoid a heap alloc for a small, frequent job.
+// One "speak this" request. text/voice are heap-owned (allocated in speak(),
+// freed by the worker once process() returns) so length isn't bounded by a
+// fixed buffer: a FreeRTOS queue item just needs a fixed *size*, and a
+// pointer is fixed size regardless of what it points to.
 struct TtsJob {
-    char text[256];
-    char voice[32];  // empty -> worker falls back to Settings::ttsVoice
+    std::string* text;
+    std::string* voice;  // nullptr -> worker falls back to Settings::ttsVoice
 };
 
 // Synthesizes speech on its own task: POSTs text to the configured FastKoko

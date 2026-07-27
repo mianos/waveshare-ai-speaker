@@ -150,6 +150,23 @@ esp_err_t handleSettings(MqttClient*, const std::string&, const JsonWrapper& d, 
     return ESP_OK;
 }
 
+// {"volume": 0-100} -> speaker_volume. A thin wrapper around the same
+// loadFromJson()/onChange machinery as "settings", just under a shorter,
+// dedicated key/topic for a value that's tweaked often.
+esp_err_t handleVolume(MqttClient*, const std::string&, const JsonWrapper& d, void* ctx) {
+    auto* app = static_cast<App*>(ctx);
+    int vol = 0;
+    if (!d.GetField("volume", vol)) {
+        ESP_LOGW(TAG, "volume command without 'volume'");
+        return ESP_OK;
+    }
+    JsonWrapper doc;
+    doc.AddItem("speaker_volume", vol);
+    app->settings->loadFromJson(doc);
+    app->settings->save();
+    return ESP_OK;
+}
+
 esp_err_t handleSay(MqttClient*, const std::string&, const JsonWrapper& d, void* ctx) {
     auto* app = static_cast<App*>(ctx);
     std::string text, voice;
@@ -276,6 +293,7 @@ extern "C" void app_main(void) {
 
     const std::string b = "cmnd/" + settings.sensorName + "/";
     mqtt.registerHandler(b + "settings",    std::regex(b + "settings"),    handleSettings,    &app);
+    mqtt.registerHandler(b + "volume",      std::regex(b + "volume"),      handleVolume,      &app);
     mqtt.registerHandler(b + "say",         std::regex(b + "say"),         handleSay,         &app);
     mqtt.registerHandler(b + "restart",     std::regex(b + "restart"),     handleRestart,     &app);
     mqtt.registerHandler(b + "reprovision", std::regex(b + "reprovision"), handleReprovision, &app);
@@ -307,6 +325,12 @@ extern "C" void app_main(void) {
     esp_err_t audioOutRet = bsp_audio_out_init();
     ESP_LOGI(TAG, "audio out init: %s", esp_err_to_name(audioOutRet));
     if (audioOutRet == ESP_OK) {
+        if (settings.speakerVolume < 0 || settings.speakerVolume > 100) {
+            ESP_LOGW(TAG, "speaker_volume %d out of range [0,100]; leaving board default", settings.speakerVolume);
+        } else {
+            esp_err_t volRet = bsp_speaker_set_volume(settings.speakerVolume);
+            ESP_LOGI(TAG, "speaker volume: %d -> %s", settings.speakerVolume, esp_err_to_name(volRet));
+        }
         if (settings.playTone) {
             ESP_LOGI(TAG, "playing start tone");
             playChime(kStartChime, sizeof(kStartChime) / sizeof(kStartChime[0]));
@@ -315,6 +339,17 @@ extern "C" void app_main(void) {
     } else {
         ESP_LOGW(TAG, "speaker unavailable; tones and TTS playback disabled");
     }
+    // speaker_volume applies live -- no reboot needed, unlike the AFE tuning
+    // fields above. Harmless to register even if the DAC never came up:
+    // bsp_speaker_set_volume() just keeps no-op'ing.
+    settings.onChange("speaker_volume", [] {
+        if (settings.speakerVolume < 0 || settings.speakerVolume > 100) {
+            ESP_LOGW(TAG, "speaker_volume %d out of range [0,100]; ignoring", settings.speakerVolume);
+            return;
+        }
+        esp_err_t r = bsp_speaker_set_volume(settings.speakerVolume);
+        ESP_LOGI(TAG, "speaker volume changed: %d -> %s", settings.speakerVolume, esp_err_to_name(r));
+    });
 
     static SttClient stt(settings, mqtt);
     stt.start();

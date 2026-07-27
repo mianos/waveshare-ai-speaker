@@ -37,10 +37,32 @@ esp_err_t bsp_mic_set_gain(float db);
 // unavailable, leaving the mic path untouched. Safe to skip entirely.
 esp_err_t bsp_audio_out_init(void);
 
+// Set the ES8311 output volume (0-100). A live esp_codec_dev register write,
+// same as bsp_mic_set_gain() -- safe to call any time after
+// bsp_audio_out_init() succeeds, no reinit needed. No-op returning
+// ESP_ERR_INVALID_STATE if the DAC hasn't been brought up.
+esp_err_t bsp_speaker_set_volume(int vol);
+
 // Play a mono 16-bit / 16 kHz PCM buffer out the speaker (blocks until written,
 // gating the power amp for the duration). No-op returning ESP_ERR_INVALID_STATE
 // if bsp_audio_out_init() has not succeeded.
 esp_err_t bsp_audio_play_mono16(const int16_t *pcm, size_t nsamples);
+
+// Incremental playback for one long/streamed clip (e.g. TTS audio arriving
+// over HTTP in chunks), as an alternative to bsp_audio_play_mono16() when the
+// whole clip isn't available up front. Keeps the power amp enabled and the
+// board's playback lock held across the whole sequence instead of toggling
+// per call, which would click and add ~10-100ms latency between chunks of
+// what should be one continuous sound.
+//
+// Call bsp_audio_stream_begin() once, then bsp_audio_stream_write() any
+// number of times with successive chunks (each a whole number of samples),
+// then bsp_audio_stream_end() once. Not reentrant -- one stream at a time,
+// same as bsp_audio_play_mono16(). All three no-op with
+// ESP_ERR_INVALID_STATE if bsp_audio_out_init() has not succeeded.
+esp_err_t bsp_audio_stream_begin(void);
+esp_err_t bsp_audio_stream_write(const int16_t *pcm, size_t nsamples);
+esp_err_t bsp_audio_stream_end(void);
 
 // Bring up the on-board WS2812 RGB strip. Best-effort; on failure bsp_led_set()
 // no-ops. Call once, after bsp_board_init().

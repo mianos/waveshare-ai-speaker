@@ -71,6 +71,10 @@ struct Settings : SettingsBase {
     // path — hence this is on by default. Set 0 to skip the ES8311 entirely
     // (boot path then identical to the mic-only firmware).
     int playTone         = 1;      // 1 ⇒ bring up ES8311 + play start/connected tones
+    // ES8311 output volume, 0-100 (matches the vendor demo's default of 70).
+    // A live esp_codec_dev register write (see bsp_speaker_set_volume()) — no
+    // reboot needed, unlike most of the esp-sr AFE tuning above.
+    int speakerVolume    = 70;
 
     explicit Settings(NvsStorageManager& nvs) : SettingsBase(nvs) {
         field("mqtt_server",  mqttServer);
@@ -86,6 +90,7 @@ struct Settings : SettingsBase {
         field("max_capture_ms", maxCaptureMs);
         field("publish_wake",   publishWakeEvent);
         field("play_tone",      playTone);
+        field("speaker_volume", speakerVolume);
         field("wakenet_mode",      wakenetMode);
         field("vad_mode",          vadMode);
         field("agc_target_dbfs",   agcTargetDbfs);

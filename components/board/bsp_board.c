@@ -256,22 +256,12 @@ esp_err_t bsp_audio_out_init(void)
     return ESP_OK;
 }
 
-esp_err_t bsp_audio_play_mono16(const int16_t *pcm, size_t nsamples)
+// Expand mono 16-bit -> stereo 32-bit slots in small chunks: each sample goes
+// in the high half of its 32-bit slot, duplicated L/R. The ES8311 is
+// configured for 16-bit words and reads those high bits (vendor-demo path).
+// Shared by the one-shot and incremental-streaming playback paths.
+static esp_err_t write_mono16_frames(const int16_t *pcm, size_t nsamples)
 {
-    if (!play_dev) return ESP_ERR_INVALID_STATE;
-    if (!pcm || nsamples == 0) return ESP_OK;
-
-    // Serialise playback: overlapping writes (e.g. connect tone vs wake blip)
-    // to the shared duplex I2S garble each other.
-    if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
-
-    // Enable the power amp and let it settle before the first sample.
-    Set_EXIO(SPK_PA_EXIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Expand mono 16-bit -> stereo 32-bit slots in small chunks: each sample
-    // goes in the high half of its 32-bit slot, duplicated L/R. The ES8311 is
-    // configured for 16-bit words and reads those high bits (vendor-demo path).
     esp_err_t ret = ESP_OK;
     int32_t frame[256 * 2];
     const size_t kChunk = 256;
@@ -288,6 +278,23 @@ esp_err_t bsp_audio_play_mono16(const int16_t *pcm, size_t nsamples)
             break;
         }
     }
+    return ret;
+}
+
+esp_err_t bsp_audio_play_mono16(const int16_t *pcm, size_t nsamples)
+{
+    if (!play_dev) return ESP_ERR_INVALID_STATE;
+    if (!pcm || nsamples == 0) return ESP_OK;
+
+    // Serialise playback: overlapping writes (e.g. connect tone vs wake blip)
+    // to the shared duplex I2S garble each other.
+    if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
+
+    // Enable the power amp and let it settle before the first sample.
+    Set_EXIO(SPK_PA_EXIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    esp_err_t ret = write_mono16_frames(pcm, nsamples);
 
     // esp_codec_dev_write only queues into the I2S DMA; the samples still need to
     // clock out. Wait for that to drain before cutting the amp, or short clips
@@ -302,6 +309,40 @@ esp_err_t bsp_audio_play_mono16(const int16_t *pcm, size_t nsamples)
     Set_EXIO(SPK_PA_EXIO, 0);
     if (s_play_lock) xSemaphoreGive(s_play_lock);
     return ret;
+}
+
+esp_err_t bsp_audio_stream_begin(void)
+{
+    if (!play_dev) return ESP_ERR_INVALID_STATE;
+    if (s_play_lock) xSemaphoreTake(s_play_lock, portMAX_DELAY);
+    Set_EXIO(SPK_PA_EXIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    return ESP_OK;
+}
+
+esp_err_t bsp_audio_stream_write(const int16_t *pcm, size_t nsamples)
+{
+    if (!play_dev) return ESP_ERR_INVALID_STATE;
+    if (!pcm || nsamples == 0) return ESP_OK;
+    return write_mono16_frames(pcm, nsamples);
+}
+
+esp_err_t bsp_speaker_set_volume(int vol)
+{
+    if (!play_dev) return ESP_ERR_INVALID_STATE;
+    return esp_codec_dev_set_out_vol(play_dev, vol);
+}
+
+esp_err_t bsp_audio_stream_end(void)
+{
+    if (!play_dev) return ESP_ERR_INVALID_STATE;
+    // Total clip length isn't known here (chunks were written incrementally),
+    // so drain by the worst case DMA depth instead of the smaller-of measure
+    // bsp_audio_play_mono16() uses -- paid once per clip, not per chunk.
+    vTaskDelay(pdMS_TO_TICKS(110));
+    Set_EXIO(SPK_PA_EXIO, 0);
+    if (s_play_lock) xSemaphoreGive(s_play_lock);
+    return ESP_OK;
 }
 
 // Bring up the on-board WS2812 strip (RMT backend). Best-effort and independent
