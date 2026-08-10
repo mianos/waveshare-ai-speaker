@@ -20,6 +20,11 @@
 // MQTT (cmnd/<name>/...):
 //   settings    any subset of the /config JSON (e.g. {"stt_url": "..."})
 //   say         {"text":"...", "voice":"..."}   voice optional; speak via TTS
+//   timer       {"seconds":N,"label":"...","announce":bool} start/replace a
+//               countdown (label/announce optional; announce speaks the
+//               remaining time once a minute until expiry); {"cancel":true}
+//               to cancel. One timer at a time; see TimerManager for why
+//               scheduling lives on-device.
 //   restart     {}
 //   reprovision {}   clears Wi-Fi creds, reboots into ESP-Touch v2 provisioning
 // Publishes:
@@ -28,6 +33,8 @@
 //   tele/<name>/stterror  {...}                           on STT failure
 //   tele/<name>/tts       {"text":...,"ms":...,"tts_ms":...}  on speech played
 //   tele/<name>/ttserror  {...}                           on TTS failure
+//   tele/<name>/timer     {"active":bool,"ends_at":epoch,"label":...} on
+//                         timer start/cancel/expiry
 //   tele/<name>/init,status                               identity + telemetry
 
 #include <string>
@@ -60,6 +67,7 @@
 #include "board.h"
 #include "SttClient.h"
 #include "TtsClient.h"
+#include "TimerManager.h"
 #include "VoicePipeline.h"
 #include "ToneGen.h"
 
@@ -105,6 +113,7 @@ struct App {
     MqttClient*  mqtt;
     WiFiManager* wifi;
     TtsClient*   tts = nullptr;  // set once constructed, later in app_main
+    TimerManager* timer = nullptr;  // set once constructed, later in app_main
 };
 
 // Wi-Fi getting an IP doesn't mean the broker is actually reachable (auth
@@ -176,6 +185,32 @@ esp_err_t handleSay(MqttClient*, const std::string&, const JsonWrapper& d, void*
     }
     d.GetField("voice", voice);
     if (app->tts) app->tts->speak(text, voice);
+    return ESP_OK;
+}
+
+// {"seconds": N, "label": "...", "announce": bool} starts/replaces a countdown
+// (label/announce optional; announce speaks the remaining time once a minute
+// until expiry); {"cancel": true} cancels whatever is running. See TimerManager.
+esp_err_t handleTimer(MqttClient*, const std::string&, const JsonWrapper& d, void* ctx) {
+    auto* app = static_cast<App*>(ctx);
+    if (!app->timer) return ESP_OK;
+
+    bool doCancel = false;
+    if (d.GetField("cancel", doCancel) && doCancel) {
+        app->timer->cancel();
+        return ESP_OK;
+    }
+
+    int seconds = 0;
+    if (!d.GetField("seconds", seconds) || seconds <= 0) {
+        ESP_LOGW(TAG, "timer command without a valid 'seconds'");
+        return ESP_OK;
+    }
+    std::string label;
+    d.GetField("label", label);
+    bool announce = false;
+    d.GetField("announce", announce);
+    app->timer->start(seconds, label, announce);
     return ESP_OK;
 }
 
@@ -295,6 +330,7 @@ extern "C" void app_main(void) {
     mqtt.registerHandler(b + "settings",    std::regex(b + "settings"),    handleSettings,    &app);
     mqtt.registerHandler(b + "volume",      std::regex(b + "volume"),      handleVolume,      &app);
     mqtt.registerHandler(b + "say",         std::regex(b + "say"),         handleSay,         &app);
+    mqtt.registerHandler(b + "timer",       std::regex(b + "timer"),       handleTimer,       &app);
     mqtt.registerHandler(b + "restart",     std::regex(b + "restart"),     handleRestart,     &app);
     mqtt.registerHandler(b + "reprovision", std::regex(b + "reprovision"), handleReprovision, &app);
     mqtt.start();
@@ -312,6 +348,16 @@ extern "C" void app_main(void) {
         esp_err_t gainRet = bsp_mic_set_gain((float)settings.micHwGainDb);
         ESP_LOGI(TAG, "mic hw gain: %d dB -> %s", settings.micHwGainDb, esp_err_to_name(gainRet));
     }
+    // mic_hw_gain_db applies live -- bsp_mic_set_gain() is just an I2C register
+    // write, safe to call any time after bsp_board_init(), same as speaker_volume.
+    settings.onChange("mic_hw_gain_db", [] {
+        if (settings.micHwGainDb < 0 || settings.micHwGainDb > 38) {
+            ESP_LOGW(TAG, "mic_hw_gain_db %d out of range [0,38]; ignoring", settings.micHwGainDb);
+            return;
+        }
+        esp_err_t r = bsp_mic_set_gain((float)settings.micHwGainDb);
+        ESP_LOGI(TAG, "mic hw gain changed: %d dB -> %s", settings.micHwGainDb, esp_err_to_name(r));
+    });
 
     // On-board RGB LED — independent of the speaker, best-effort (non-fatal).
     // Flashed green by the voice pipeline while a wakeword is being captured.
@@ -360,6 +406,9 @@ extern "C" void app_main(void) {
     tts.start();
     app.tts = &tts;
     xTaskCreate(mqttConnectedSpeechTask, "mqtt_say", 4096, &app, 4, nullptr);
+
+    static TimerManager timerMgr(mqtt, tts, settings.sensorName);
+    app.timer = &timerMgr;
 
     // Web server: /healthz, /reset, /set_hostname plus /firmware, /config,
     // /config/reset, /say.
