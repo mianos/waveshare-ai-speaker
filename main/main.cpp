@@ -20,6 +20,10 @@
 // MQTT (cmnd/<name>/...):
 //   settings    any subset of the /config JSON (e.g. {"stt_url": "..."})
 //   say         {"text":"...", "voice":"..."}   voice optional; speak via TTS
+//   play        {"url":"..."}   fetch + play a raw-PCM clip (16 kHz mono
+//               s16le); url optional ({"url":""} plays the play_url setting —
+//               the wrapper drops a bare {} before dispatch, so the payload
+//               must be non-empty JSON)
 //   timer       {"seconds":N,"label":"...","announce":bool} start/replace a
 //               countdown (label/announce optional; announce speaks the
 //               remaining time once a minute until expiry); {"cancel":true}
@@ -33,6 +37,8 @@
 //   tele/<name>/stterror  {...}                           on STT failure
 //   tele/<name>/tts       {"text":...,"ms":...,"tts_ms":...}  on speech played
 //   tele/<name>/ttserror  {...}                           on TTS failure
+//   tele/<name>/play      {"url":...,"ms":...,"http_ms":...}  on clip played
+//   tele/<name>/playerror {...}                           on play failure
 //   tele/<name>/timer     {"active":bool,"ends_at":epoch,"label":...} on
 //                         timer start/cancel/expiry
 //   tele/<name>/init,status                               identity + telemetry
@@ -65,6 +71,7 @@
 #include "JsonWrapper.h"
 
 #include "board.h"
+#include "PcmPlayer.h"
 #include "SttClient.h"
 #include "TtsClient.h"
 #include "TimerManager.h"
@@ -114,6 +121,7 @@ struct App {
     WiFiManager* wifi;
     TtsClient*   tts = nullptr;  // set once constructed, later in app_main
     TimerManager* timer = nullptr;  // set once constructed, later in app_main
+    PcmPlayer*   player = nullptr;  // set once constructed, later in app_main
 };
 
 // Wi-Fi getting an IP doesn't mean the broker is actually reachable (auth
@@ -185,6 +193,16 @@ esp_err_t handleSay(MqttClient*, const std::string&, const JsonWrapper& d, void*
     }
     d.GetField("voice", voice);
     if (app->tts) app->tts->speak(text, voice);
+    return ESP_OK;
+}
+
+// {"url":"..."} fetches and plays a raw-PCM cue clip (16 kHz mono s16le). url
+// is optional — missing/empty falls back to Settings::playUrl. See PcmPlayer.
+esp_err_t handlePlay(MqttClient*, const std::string&, const JsonWrapper& d, void* ctx) {
+    auto* app = static_cast<App*>(ctx);
+    std::string url;
+    d.GetField("url", url);
+    if (app->player) app->player->play(url);
     return ESP_OK;
 }
 
@@ -330,6 +348,7 @@ extern "C" void app_main(void) {
     mqtt.registerHandler(b + "settings",    std::regex(b + "settings"),    handleSettings,    &app);
     mqtt.registerHandler(b + "volume",      std::regex(b + "volume"),      handleVolume,      &app);
     mqtt.registerHandler(b + "say",         std::regex(b + "say"),         handleSay,         &app);
+    mqtt.registerHandler(b + "play",        std::regex(b + "play"),        handlePlay,        &app);
     mqtt.registerHandler(b + "timer",       std::regex(b + "timer"),       handleTimer,       &app);
     mqtt.registerHandler(b + "restart",     std::regex(b + "restart"),     handleRestart,     &app);
     mqtt.registerHandler(b + "reprovision", std::regex(b + "reprovision"), handleReprovision, &app);
@@ -410,10 +429,16 @@ extern "C" void app_main(void) {
     static TimerManager timerMgr(mqtt, tts, settings.sensorName);
     app.timer = &timerMgr;
 
+    // Cue clip player ("play" command). Shares the board play lock with the
+    // tone cues and TTS, so requests serialise rather than collide.
+    static PcmPlayer player(settings, mqtt);
+    player.start();
+    app.player = &player;
+
     // Web server: /healthz, /reset, /set_hostname plus /firmware, /config,
-    // /config/reset, /say.
+    // /config/reset, /say, /play.
     static WebContext webctx(&wifi);
-    static VoiceWebServer web(&webctx, settings, tts);
+    static VoiceWebServer web(&webctx, settings, tts, player);
     web.start();
 
     xTaskCreate(otaVerifyTask, "ota_verify", 4096, nullptr, 4, nullptr);

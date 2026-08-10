@@ -32,6 +32,12 @@ struct Settings : SettingsBase {
     std::string ttsUrl   = "http://docker-host.mianos.com:8880/v1/audio/speech?sample_rate=16000";
     std::string ttsVoice = "af_heart";
 
+    // "play" command: URL of a raw-PCM cue clip (16 kHz mono s16le, no
+    // container — the board's native format; see the README's ffmpeg recipe)
+    // used when a play command arrives without a "url" field. The pcm/
+    // directory on the web host holds pre-converted clips.
+    std::string playUrl  = "http://mqtt2.mianos.com/pcm/plucky.pcm";
+
     // Capture end-of-utterance tuning.
     int vadSilenceMs     = 700;    // stop after this much continuous silence
     int maxCaptureMs     = 8000;   // hard cap on a single utterance
@@ -86,6 +92,7 @@ struct Settings : SettingsBase {
         field("stt_language", sttLanguage);
         field("tts_url",      ttsUrl);
         field("tts_voice",    ttsVoice);
+        field("play_url",     playUrl);
         field("vad_silence_ms", vadSilenceMs);
         field("max_capture_ms", maxCaptureMs);
         field("publish_wake",   publishWakeEvent);

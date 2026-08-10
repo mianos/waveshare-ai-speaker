@@ -74,6 +74,7 @@ curl http://<ip>/config            # read current settings
 | `play_tone`    | `1`                         | play start / connected / wake tone cues (set 0 to disable; the ES8311 itself is always brought up — see below) |
 | `tts_url`      | `http://docker-host.mianos.com:8880/v1/audio/speech?sample_rate=16000` | FastKoko (Kokoro-FastAPI) speech endpoint for the `say` command |
 | `tts_voice`    | `af_heart`                  | default voice; overridable per `say` call      |
+| `play_url`     | `http://mqtt2.mianos.com/pcm/plucky.pcm` | default raw-PCM cue clip for the `play` command |
 | `wakenet_mode` | `-1` (esp-sr default)       | WakeNet sensitivity: `0`/`1`=90%/95% normal, `2`/`3`=2-channel 90%/95% (this board's array), `4`/`5`=3-channel. Higher = more sensitive, more false triggers |
 | `vad_mode`     | `-1` (esp-sr default)       | VAD aggressiveness `0`-`4` (`0`=normal…`4`=very very very aggressive); *lower* reports speech more readily |
 | `agc_target_dbfs` | `-1` (esp-sr default, `3`) | AGC target envelope in -dBFS |
@@ -116,6 +117,28 @@ path is unaffected (`play_tone`/`say` then just no-op). Two things use it:
   bus), so no resampling happens in firmware. A single utterance is capped at
   15 s of audio; a longer response is played up to the cap and logged as
   truncated.
+- **`play` (cue clips)** — fetch and play a pre-converted raw-PCM clip by URL,
+  over MQTT or HTTP:
+  ```
+  mosquitto_pub -t 'cmnd/wsvoice/play' -m '{"url":""}'              # default (play_url)
+  mosquitto_pub -t 'cmnd/wsvoice/play' -m '{"url":"http://mqtt2.mianos.com/pcm/plucky.pcm"}'
+  curl -X POST -d '{}' http://<ip>/play                             # default (play_url)
+  ```
+  Over MQTT the payload must be *non-empty* JSON (`{"url":""}` for the
+  default) — the shared MQTT wrapper drops a bare `{}` before dispatch. The
+  HTTP route has no such constraint: an empty or `{}` body plays the default.
+  Like `say`, the device does no decoding or resampling — the URL must serve
+  the board's native format: **raw 16 kHz mono s16le, no container**. Unlike
+  the TTS stream, the whole clip is buffered into PSRAM (capped at 2 MB ≈ 64 s)
+  before playback starts, so a mid-download Wi-Fi stall can't punch a gap in
+  the sound. Convert an MP3 on the web host (`/var/www/html/pcm/`) with:
+  ```
+  ffmpeg -i clip.mp3 -af "volume=0.45,adelay=100" -ar 16000 -ac 1 -f s16le pcm/clip.pcm
+  ```
+  `adelay=100` prepends 100 ms of silence to cover the speaker amp's bias-up
+  (an attack at sample 0 gets swallowed — same reason the wake blip carries a
+  lead-in); tune `volume` per file so the peak lands near the tone amplitude
+  (~12000) rather than the int16 rails.
 
 Both features share one playback path (`bsp_audio_play_mono16`, serialised by
 a mutex so a tone cue and a `say` can't collide) and publish `tele/<name>/tts`
@@ -152,7 +175,8 @@ speaches, whisper.cpp's server and the OpenAI `/v1/audio/transcriptions` API.
 
 ## MQTT topics
 
-Commands (`cmnd/<name>/…`): `settings`, `say`, `restart`, `reprovision`.
+Commands (`cmnd/<name>/…`): `settings`, `say`, `play`, `timer`, `volume`,
+`restart`, `reprovision`.
 Telemetry (`tele/<name>/…`):
 
 | topic       | payload                                        |
@@ -162,14 +186,17 @@ Telemetry (`tele/<name>/…`):
 | `stterror`  | `{"error":…, …}` (unset URL, HTTP error, bad response) |
 | `tts`       | `{"text":…, "ms":…, "tts_ms":…}` (speech played; `tts_ms` = round-trip latency) |
 | `ttserror`  | `{"error":…, …}` (unset URL, HTTP error, empty response, speaker unavailable) |
+| `play`      | `{"url":…, "ms":…, "http_ms":…}` (clip played; `http_ms` = fetch latency) |
+| `playerror` | `{"error":…, …}` (unset URL, HTTP error, too large, empty, speaker unavailable) |
 | `init`      | version / build / ip, once on connect          |
 | `status`    | uptime, heap, psram every 60 s                  |
 
 ## Web endpoints
 
 `GET /healthz`, `POST /reset`, `POST /set_hostname` (mianos base) plus
-`GET|POST /config`, `POST /config/reset`, `POST /say`, `GET|POST /firmware`
-(raw-body OTA to the inactive slot; verified after reconnect, else rolled back).
+`GET|POST /config`, `POST /config/reset`, `POST /say`, `POST /play`,
+`GET|POST /volume`, `GET|POST /firmware` (raw-body OTA to the inactive slot;
+verified after reconnect, else rolled back).
 
 ## Tests
 

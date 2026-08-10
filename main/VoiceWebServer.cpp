@@ -12,6 +12,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "PcmPlayer.h"
 #include "Settings.h"
 #include "TtsClient.h"
 #include "WifiManager.h"
@@ -47,8 +48,8 @@ esp_err_t send_json(httpd_req_t* req, const JsonWrapper& json) {
 
 }  // namespace
 
-VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts)
-    : WebServer(ctx), settings_(settings), tts_(tts) {}
+VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player)
+    : WebServer(ctx), settings_(settings), tts_(tts), player_(player) {}
 
 esp_err_t VoiceWebServer::start() {
     esp_err_t r = WebServer::start();
@@ -59,13 +60,14 @@ esp_err_t VoiceWebServer::start() {
         httpd_method_t method;
         esp_err_t (*handler)(httpd_req_t*);
     };
-    const std::array<Route, 8> routes = {{
+    const std::array<Route, 9> routes = {{
         {"/firmware",     HTTP_POST, firmware_post_handler},
         {"/firmware",     HTTP_GET,  firmware_get_handler},
         {"/config",       HTTP_GET,  config_get_handler},
         {"/config",       HTTP_POST, config_post_handler},
         {"/config/reset", HTTP_POST, config_reset_post_handler},
         {"/say",          HTTP_POST, say_post_handler},
+        {"/play",         HTTP_POST, play_post_handler},
         {"/volume",       HTTP_GET,  volume_get_handler},
         {"/volume",       HTTP_POST, volume_post_handler},
     }};
@@ -239,6 +241,29 @@ esp_err_t VoiceWebServer::say_post_handler(httpd_req_t* req) {
     json.GetField("voice", voice);
 
     bool queued = self->tts_.speak(text, voice);
+    JsonWrapper resp;
+    resp.AddItem("status", std::string(queued ? "queued" : "dropped_queue_full"));
+    return send_json(req, resp);
+}
+
+// POST /play — {"url":"..."} (url optional, falls back to Settings::playUrl).
+// Fetches a raw-PCM clip (16 kHz mono s16le) and plays it out the speaker.
+// Enqueues onto the player worker and returns immediately; mirrors the "play"
+// MQTT command. Deliberately lenient about the body: no body, `{}` and a
+// parse failure all play the default clip rather than 400 — JsonWrapper's
+// Empty() can't tell an empty object from invalid JSON, and for a cue
+// trigger "just play something" beats rejecting the request.
+esp_err_t VoiceWebServer::play_post_handler(httpd_req_t* req) {
+    VoiceWebServer* self = static_cast<VoiceWebServer*>(req->user_ctx);
+    if (req->content_len > kMaxJsonBodyBytes) return sendJsonError(req, 413, "request body too large");
+
+    std::string url;
+    if (req->content_len > 0) {
+        JsonWrapper json = JsonWrapper::Parse(read_request_body(req));
+        json.GetField("url", url);
+    }
+
+    bool queued = self->player_.play(url);
     JsonWrapper resp;
     resp.AddItem("status", std::string(queued ? "queued" : "dropped_queue_full"));
     return send_json(req, resp);

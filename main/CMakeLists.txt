@@ -1,7 +1,7 @@
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-idf_component_register(SRCS "main.cpp" "SttClient.cpp" "TtsClient.cpp" "TimerManager.cpp" "VoicePipeline.cpp" "VoiceWebServer.cpp"
+idf_component_register(SRCS "main.cpp" "PcmPlayer.cpp" "SttClient.cpp" "TtsClient.cpp" "TimerManager.cpp" "VoicePipeline.cpp" "VoiceWebServer.cpp"
                        INCLUDE_DIRS "."
                        REQUIRES
                          nvsstoragemanager
