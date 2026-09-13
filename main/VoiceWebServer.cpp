@@ -3,7 +3,10 @@
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <cstdlib>
 #include <string>
+
+#include "esp_rom_crc.h"
 
 #include "esp_app_desc.h"
 #include "esp_log.h"
@@ -12,9 +15,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
+#include "esp_partition.h"
+
 #include "PcmPlayer.h"
 #include "Settings.h"
 #include "TtsClient.h"
+#include "VoicePipeline.h"
 #include "WifiManager.h"
 
 namespace {
@@ -48,8 +54,9 @@ esp_err_t send_json(httpd_req_t* req, const JsonWrapper& json) {
 
 }  // namespace
 
-VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player)
-    : WebServer(ctx), settings_(settings), tts_(tts), player_(player) {}
+VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player,
+                               VoicePipeline& voice)
+    : WebServer(ctx), settings_(settings), tts_(tts), player_(player), voice_(voice) {}
 
 esp_err_t VoiceWebServer::start() {
     esp_err_t r = WebServer::start();
@@ -60,9 +67,11 @@ esp_err_t VoiceWebServer::start() {
         httpd_method_t method;
         esp_err_t (*handler)(httpd_req_t*);
     };
-    const std::array<Route, 9> routes = {{
+    const std::array<Route, 11> routes = {{
         {"/firmware",     HTTP_POST, firmware_post_handler},
         {"/firmware",     HTTP_GET,  firmware_get_handler},
+        {"/model",        HTTP_POST, model_post_handler},
+        {"/model",        HTTP_GET,  model_get_handler},
         {"/config",       HTTP_GET,  config_get_handler},
         {"/config",       HTTP_POST, config_post_handler},
         {"/config/reset", HTTP_POST, config_reset_post_handler},
@@ -95,6 +104,8 @@ void VoiceWebServer::populate_healthz_fields(WebContext*, JsonWrapper& json) {
     json.AddItem("version",   std::string(desc->version));
     json.AddItem("partition", std::string(running->label));
     json.AddItem("heap_free", static_cast<int>(esp_get_free_heap_size()));
+    json.AddItem("voice",     std::string(voice_.startedOk() ? "running" : "disabled"));
+    json.AddItem("wakeword_model", std::string(voice_.wakeModel()));
 }
 
 // POST /firmware — raw .bin body. Streams into the inactive OTA slot, sets it as
@@ -149,6 +160,103 @@ esp_err_t VoiceWebServer::firmware_post_handler(httpd_req_t* req) {
     vTaskDelay(pdMS_TO_TICKS(500));
     esp_restart();
     return ESP_OK;
+}
+
+// POST /model — raw srmodels.bin body (the esp-sr build's packed WakeNet/VAD
+// model image). Writes the "model" data partition, which the app OTA path
+// can't reach, then reboots so esp_srmodel_init() picks up the new contents.
+// Deploy: curl --data-binary @build/srmodels/srmodels.bin http://<host>/model
+//
+// The voice pipeline is suspended first: WakeNet inference reads the model
+// straight out of memory-mapped flash, so rewriting it live would feed the
+// detector garbage mid-write. There is no resume — the reboot at the end is
+// the recovery. An interrupted upload leaves a corrupt partition; that is
+// survivable because VoicePipeline::start() detects the missing model and
+// boots without voice (web server still up) so the upload can be retried.
+esp_err_t VoiceWebServer::model_post_handler(httpd_req_t* req) {
+    VoiceWebServer* self = static_cast<VoiceWebServer*>(req->user_ctx);
+    if (req->content_len <= 0) return sendJsonError(req, 400, "Content-Length required");
+
+    const esp_partition_t* target = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+    if (target == nullptr) return sendJsonError(req, 500, "no 'model' partition");
+    if (req->content_len > static_cast<int>(target->size)) {
+        return sendJsonError(req, 413, "image larger than model partition");
+    }
+    ESP_LOGI(TAG, "model: writing %d bytes to %s @ 0x%" PRIx32,
+        req->content_len, target->label, target->address);
+
+    self->voice_.suspendForModelUpdate();
+
+    // Erase only the range the new image needs (4 KB sector aligned) — the old
+    // image's tail past that is unreachable garbage; srmodels' own header
+    // carries the real sizes. Erasing all 6 MB would add ~30 s for nothing.
+    const size_t eraseLen = (static_cast<size_t>(req->content_len) + 4095) & ~size_t(4095);
+    esp_err_t err = esp_partition_erase_range(target, 0, eraseLen);
+    if (err != ESP_OK) return sendJsonError(req, 500, esp_err_to_name(err));
+
+    char buf[1024];
+    int remaining = req->content_len;
+    size_t written = 0;
+    while (remaining > 0) {
+        int got = httpd_req_recv(req, buf, std::min<int>(remaining, static_cast<int>(sizeof(buf))));
+        if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;
+        if (got <= 0) return sendJsonError(req, 400, "request body truncated");
+        err = esp_partition_write(target, written, buf, got);
+        if (err != ESP_OK) return sendJsonError(req, 500, esp_err_to_name(err));
+        written   += got;
+        remaining -= got;
+    }
+
+    ESP_LOGW(TAG, "model: %zu bytes written; rebooting", written);
+    JsonWrapper resp;
+    resp.AddItem("status",  std::string("ok"));
+    resp.AddItem("written", static_cast<int>(written));
+    send_json(req, resp);
+
+    vTaskDelay(pdMS_TO_TICKS(500));
+    esp_restart();
+    return ESP_OK;
+}
+
+// GET /model?len=N — CRC32 of the first N bytes of the model partition, so a
+// host can verify an upload landed byte-exact:
+//   curl "http://<host>/model?len=$(stat -f%z srmodels.bin)"
+//   python3 -c 'import zlib,sys; print("%08x" % zlib.crc32(open(sys.argv[1],"rb").read()))' srmodels.bin
+// (CRC32 via the ROM helper — mbedtls 4 in IDF 6 dropped the legacy sha256
+// API, and corruption detection doesn't need a cryptographic hash.)
+esp_err_t VoiceWebServer::model_get_handler(httpd_req_t* req) {
+    const esp_partition_t* target = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "model");
+    if (target == nullptr) return sendJsonError(req, 500, "no 'model' partition");
+
+    size_t len = 0;
+    char query[64];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        char val[16];
+        if (httpd_query_key_value(query, "len", val, sizeof(val)) == ESP_OK) {
+            len = static_cast<size_t>(strtoul(val, nullptr, 10));
+        }
+    }
+    if (len == 0 || len > target->size) return sendJsonError(req, 400, "len required (1..partition size)");
+
+    // Match zlib.crc32: init 0, standard reflected polynomial.
+    uint32_t crc = 0;
+    uint8_t buf[1024];
+    for (size_t off = 0; off < len; ) {
+        const size_t n = std::min(len - off, sizeof(buf));
+        esp_err_t err = esp_partition_read(target, off, buf, n);
+        if (err != ESP_OK) return sendJsonError(req, 500, esp_err_to_name(err));
+        crc = esp_rom_crc32_le(crc, buf, n);
+        off += n;
+    }
+
+    char hex[9];
+    std::snprintf(hex, sizeof(hex), "%08x", (unsigned)crc);
+    JsonWrapper resp;
+    resp.AddItem("len",   static_cast<int>(len));
+    resp.AddItem("crc32", std::string(hex));
+    return send_json(req, resp);
 }
 
 esp_err_t VoiceWebServer::firmware_get_handler(httpd_req_t* req) {

@@ -18,6 +18,7 @@ idf_component_register(SRCS "main.cpp" "PcmPlayer.cpp" "SttClient.cpp" "TtsClien
                          esp_event
                          nvs_flash
                          app_update
+                         esp_partition
                          esp_timer)
 # esp-sr is pulled in via idf_component.yml and auto-added to this component's
 # requirements (its managed-component name is not spelled here to avoid a

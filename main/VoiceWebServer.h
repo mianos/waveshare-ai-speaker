@@ -9,11 +9,15 @@
 struct Settings;
 class TtsClient;
 class PcmPlayer;
+class VoicePipeline;
 
 // ws-voice HTTP control surface, layered on the shared WebServer base
 // (/reset, /set_hostname, /healthz). Adds:
 //   POST /firmware       raw .bin body -> inactive OTA slot -> reboot
 //   GET  /firmware       running image version / partition
+//   POST /model          raw srmodels.bin body -> "model" partition -> reboot
+//                        (the esp-sr WakeNet/VAD models; OTA app slots can't
+//                        carry these — see partitions.csv)
 //   GET  /config         current settings as JSON
 //   POST /config         apply + persist a subset of settings
 //   POST /config/reset   restore settings to defaults (optional wifi wipe)
@@ -25,7 +29,8 @@ class PcmPlayer;
 // Handlers recover this instance from req->user_ctx.
 class VoiceWebServer : public WebServer {
 public:
-    VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player);
+    VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player,
+                   VoicePipeline& voice);
 
     esp_err_t start() override;
 
@@ -35,6 +40,8 @@ protected:
 private:
     static esp_err_t firmware_post_handler(httpd_req_t* req);
     static esp_err_t firmware_get_handler(httpd_req_t* req);
+    static esp_err_t model_post_handler(httpd_req_t* req);
+    static esp_err_t model_get_handler(httpd_req_t* req);
     static esp_err_t config_get_handler(httpd_req_t* req);
     static esp_err_t config_post_handler(httpd_req_t* req);
     static esp_err_t config_reset_post_handler(httpd_req_t* req);
@@ -43,7 +50,8 @@ private:
     static esp_err_t volume_get_handler(httpd_req_t* req);
     static esp_err_t volume_post_handler(httpd_req_t* req);
 
-    Settings&  settings_;
-    TtsClient& tts_;
-    PcmPlayer& player_;
+    Settings&      settings_;
+    TtsClient&     tts_;
+    PcmPlayer&     player_;
+    VoicePipeline& voice_;
 };

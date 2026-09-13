@@ -47,10 +47,13 @@ struct Settings : SettingsBase {
     // fields means "leave esp-sr's own default for this hardware/input format
     // alone" — only a non-negative value is applied to the AFE config, so an
     // untouched install behaves exactly as before this setting existed.
-    // wakenet_mode: det_mode_t — 0=90% normal, 1=95% aggressive, 2/3=2-channel
-    // 90%/95% (this board has a 2-mic array), 4/5=3-channel. Higher = more
-    // sensitive trigger, more false alarms.
-    int wakenetMode      = -1;
+    // wakenet_mode: det_mode_t — 0=90% normal, 1=95% aggressive. The 2CH/3CH
+    // values (2-5) are legacy WakeNet8 modes: setting them on the WN9 model
+    // made detection silently dead (observed on-device), so don't — the AFE
+    // already fuses both mics into the one channel WakeNet scores. Default 1:
+    // bias toward not missing wakes; false triggers are cheap because the STT
+    // transcript filters them downstream.
+    int wakenetMode      = 1;
     // vad_mode: vad_mode_t 0-4 (0=normal .. 4=very very very aggressive). A
     // *lower* mode reports speech more readily (good for a quiet/near-field
     // mic); higher rejects more as noise.

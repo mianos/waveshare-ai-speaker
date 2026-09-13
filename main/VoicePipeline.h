@@ -16,7 +16,7 @@ class SttClient;
 //
 // Two pinned tasks (mirroring esp-sr's reference topology):
 //   feed  (core 0) — pulls mic frames from the board and feeds the AFE.
-//   detect(core 1) — fetches AFE output; on the "Computer" wakeword it captures
+//   detect(core 1) — fetches AFE output; on the "Hi, ESP" wakeword it captures
 //                    the following speech (AFE-enhanced mono 16 kHz), ending on
 //                    VAD silence or a max-duration cap, then hands the buffer to
 //                    SttClient.
@@ -28,8 +28,24 @@ public:
     VoicePipeline(Settings& settings, MqttClient& mqtt, SttClient& stt);
 
     // Initialise esp-sr (models from the "model" flash partition) and start the
-    // feed + detect tasks. Call after bsp_board_init().
+    // feed + detect tasks. Call after bsp_board_init(). If the model partition
+    // holds no usable WakeNet model (e.g. a /model upload was interrupted),
+    // logs and returns without starting — the device stays up (web/MQTT/OTA)
+    // so a fresh model can be uploaded, instead of boot-looping.
     void start();
+
+    // Permanently suspend the feed/detect/tone tasks so nothing reads the
+    // memory-mapped model flash any more. Called by the /model upload handler
+    // right before it rewrites the model partition; the device reboots
+    // immediately after the write, so there is deliberately no resume path.
+    void suspendForModelUpdate();
+
+    // Observability for /healthz: whether start() completed (tasks running)
+    // and which WakeNet model esp_srmodel_filter picked from the partition —
+    // the only remote way to distinguish "pipeline disabled (bad model
+    // partition)" from "running but not triggering".
+    bool        startedOk() const { return started_; }
+    const char* wakeModel() const { return wakeModel_[0] ? wakeModel_ : "none"; }
 
 private:
     static void feedTrampoline(void* arg);
@@ -44,7 +60,13 @@ private:
     void toneLoop();
     void playWakeTone();
 
-    TaskHandle_t toneTaskHandle_ = nullptr;
+    TaskHandle_t toneTaskHandle_    = nullptr;
+    TaskHandle_t feedTaskHandle_    = nullptr;
+    TaskHandle_t captureTaskHandle_ = nullptr;
+
+    bool     started_ = false;
+    char     wakeModel_[32] = {0};
+    uint32_t wakeCount_ = 0;  // wakes since boot; only touched by the detect task
 
     // Mic channel layout read back from the AFE pcm_config after
     // afe_config_init(), so feedTask() can log per-mic-channel levels without

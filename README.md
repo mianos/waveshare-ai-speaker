@@ -1,12 +1,12 @@
 # ws-voice
 
 Voice control bridge for a **Waveshare ESP32-S3 audio board**. On the wakeword
-**"Computer"** (detected on-device by esp-sr / WakeNet9) it records the following
+**"Hi, ESP"** (detected on-device by esp-sr / WakeNet9) it records the following
 speech, POSTs it to a configurable Whisper-style speech-to-text server, and
 publishes the transcript to MQTT for Node-RED (or anything else) to act on.
 
 ```
-mic (ES7210) ──▶ esp-sr AFE ──▶ WakeNet "Computer" ──▶ capture (VAD-ended)
+mic (ES7210) ──▶ esp-sr AFE ──▶ WakeNet "Hi, ESP" ──▶ capture (VAD-ended)
                                                           │
                                     WAV + multipart POST ─┘
                                                           ▼
@@ -75,7 +75,7 @@ curl http://<ip>/config            # read current settings
 | `tts_url`      | `http://docker-host.mianos.com:8880/v1/audio/speech?sample_rate=16000` | FastKoko (Kokoro-FastAPI) speech endpoint for the `say` command |
 | `tts_voice`    | `af_heart`                  | default voice; overridable per `say` call      |
 | `play_url`     | `http://mqtt2.mianos.com/pcm/plucky.pcm` | default raw-PCM cue clip for the `play` command |
-| `wakenet_mode` | `-1` (esp-sr default)       | WakeNet sensitivity: `0`/`1`=90%/95% normal, `2`/`3`=2-channel 90%/95% (this board's array), `4`/`5`=3-channel. Higher = more sensitive, more false triggers |
+| `wakenet_mode` | `1` (95%, aggressive)       | WakeNet sensitivity: `0`=90%, `1`=95%, `-1`=esp-sr's default. Do **not** use the 2CH/3CH values (`2`-`5`) — they are legacy WakeNet8 modes and make WN9 detection silently dead; the AFE already fuses both mics before WakeNet |
 | `vad_mode`     | `-1` (esp-sr default)       | VAD aggressiveness `0`-`4` (`0`=normal…`4`=very very very aggressive); *lower* reports speech more readily |
 | `agc_target_dbfs` | `-1` (esp-sr default, `3`) | AGC target envelope in -dBFS |
 | `agc_compression_db` | `-1` (esp-sr default, `9`) | AGC fixed digital compression gain, dB |
@@ -181,7 +181,8 @@ Telemetry (`tele/<name>/…`):
 
 | topic       | payload                                        |
 |-------------|------------------------------------------------|
-| `wake`      | `{"event":"wake"}` (each wakeword)             |
+| `wake`      | `{"event":"wake","n":…,"volume_db":…,"channel":…,"wake_ms":…}` (each wakeword; `n` = wakes since boot, `volume_db` = input level over WakeNet's ~1.5 s window pre-AGC — the number to watch when tuning `mic_hw_gain_db`) |
+| `miclevel`  | `{"ms":…,"mic0_rms_db":…,"mic0_peak_db":…,…}` per capture, when `mic_level_log=1` (peaks near 0 dBFS ⇒ clipping) |
 | `stt`       | `{"text":…, "ms":…, "stt_ms":…}` (transcript; `stt_ms` = round-trip latency) |
 | `stterror`  | `{"error":…, …}` (unset URL, HTTP error, bad response) |
 | `tts`       | `{"text":…, "ms":…, "tts_ms":…}` (speech played; `tts_ms` = round-trip latency) |
@@ -196,7 +197,12 @@ Telemetry (`tele/<name>/…`):
 `GET /healthz`, `POST /reset`, `POST /set_hostname` (mianos base) plus
 `GET|POST /config`, `POST /config/reset`, `POST /say`, `POST /play`,
 `GET|POST /volume`, `GET|POST /firmware` (raw-body OTA to the inactive slot;
-verified after reconnect, else rolled back).
+verified after reconnect, else rolled back), and `POST /model` (raw
+`srmodels.bin` body → the `model` partition → reboot; this is how the WakeNet
+model is changed over Wi-Fi, since app OTA can't write that partition —
+`curl --data-binary @build/srmodels/srmodels.bin http://<host>/model`).
+An interrupted model upload is recoverable: the device boots with voice
+disabled but the web server up, so just re-upload.
 
 ## Tests
 
@@ -218,7 +224,7 @@ CI (`.gitlab-ci.yml`) runs those tests then builds the firmware under
 1. `bash test/host/run.sh` — wire builders pass.
 2. `./build.sh && idf.py -b 115200 flash monitor`; first boot provisions Wi-Fi
    via ESP-Touch v2.
-3. Say **"Computer"** (the phrase is fixed by the wn9_computer_tts model —
+3. Say **"Hi, ESP"** (the phrase is fixed by the wn9_hiesp model —
    nothing else triggers it) → the RGB LED lights green, a short blip plays, the log shows
    the trigger, and `tele/wsvoice/wake` is published. The LED clears when
    capture ends.

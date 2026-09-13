@@ -1,6 +1,6 @@
 // ws-voice — Waveshare ESP32-S3 audio board voice → MQTT bridge.
 //
-// On the "Computer" wakeword (on-device esp-sr WakeNet) it records the following
+// On the "Hi, ESP" wakeword (on-device esp-sr WakeNet) it records the following
 // speech (AFE-enhanced 16 kHz mono, ended by VAD silence or a max cap), POSTs
 // the audio to a configurable Whisper-style STT server, and publishes the
 // transcript to MQTT for Node-RED to act on. Shares its infrastructure
@@ -435,10 +435,10 @@ extern "C" void app_main(void) {
     player.start();
     app.player = &player;
 
-    // Web server: /healthz, /reset, /set_hostname plus /firmware, /config,
-    // /config/reset, /say, /play.
+    // Web server: /healthz, /reset, /set_hostname plus /firmware, /model,
+    // /config, /config/reset, /say, /play.
     static WebContext webctx(&wifi);
-    static VoiceWebServer web(&webctx, settings, tts, player);
+    static VoiceWebServer web(&webctx, settings, tts, player, voice);
     web.start();
 
     xTaskCreate(otaVerifyTask, "ota_verify", 4096, nullptr, 4, nullptr);

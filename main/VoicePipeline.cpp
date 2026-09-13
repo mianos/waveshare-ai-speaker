@@ -79,11 +79,26 @@ void VoicePipeline::start() {
     levelMutex_ = xSemaphoreCreateMutex();
 
     s_models = esp_srmodel_init("model");  // SPIFFS partition label in partitions.csv
+    // Anti-brick guard: a corrupt/empty model partition (e.g. an interrupted
+    // /model upload) must not take down boot — web/MQTT/OTA stay up so the
+    // model can be re-uploaded. Voice is simply disabled until then.
+    const char* wnName = s_models ? esp_srmodel_filter(s_models, ESP_WN_PREFIX, nullptr) : nullptr;
+    if (!wnName) {
+        ESP_LOGE(TAG, "no WakeNet model in the 'model' partition; voice pipeline "
+                      "disabled (re-upload via POST /model, then reboot)");
+        return;
+    }
+    std::snprintf(wakeModel_, sizeof(wakeModel_), "%s", wnName);
+    ESP_LOGI(TAG, "wakenet model: %s", wakeModel_);
     afe_config_t* cfg = afe_config_init(esp_get_input_format(), s_models,
                                         AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    if (!cfg) {
+        ESP_LOGE(TAG, "afe_config_init failed; voice pipeline disabled");
+        return;
+    }
     cfg->ns_init  = true;   // noise suppression — cleaner audio for the STT server
     cfg->vad_init = true;   // VAD drives end-of-utterance detection
-    // wakenet stays enabled (WN9 "Computer" from sdkconfig); MultiNet is disabled
+    // wakenet stays enabled (WN9 "Hi, ESP" from sdkconfig); MultiNet is disabled
     // in sdkconfig, so no command model is loaded.
     applyAfeTuning(cfg, settings_);
 
@@ -97,9 +112,23 @@ void VoicePipeline::start() {
     // Tone task: unpinned, below the feed/detect tasks — plays the wake blip
     // off the detect task (see toneLoop).
     xTaskCreate(toneTrampoline, "vp_tone", 4 * 1024, this, 4, &toneTaskHandle_);
-    xTaskCreatePinnedToCore(captureTrampoline, "vp_detect", 8 * 1024, this, 5, nullptr, 1);
-    xTaskCreatePinnedToCore(feedTrampoline,    "vp_feed",   8 * 1024, this, 5, nullptr, 0);
-    ESP_LOGI(TAG, "voice pipeline started (wakeword 'Computer')");
+    xTaskCreatePinnedToCore(captureTrampoline, "vp_detect", 8 * 1024, this, 5, &captureTaskHandle_, 1);
+    xTaskCreatePinnedToCore(feedTrampoline,    "vp_feed",   8 * 1024, this, 5, &feedTaskHandle_, 0);
+    started_ = true;
+    ESP_LOGI(TAG, "voice pipeline started (wakeword 'Hi, ESP')");
+}
+
+// The AFE's WakeNet inference reads model coefficients straight out of
+// memory-mapped flash (CONFIG_MODEL_IN_FLASH) — rewriting the partition under
+// it would feed the detector garbage and risk a crash mid-write. Suspend
+// everything that drives the AFE first; the null guards matter because start()
+// may have bailed (no model) leaving the handles unset, and vTaskSuspend(NULL)
+// would suspend the *calling* task — the web server handling the upload.
+void VoicePipeline::suspendForModelUpdate() {
+    if (feedTaskHandle_)    vTaskSuspend(feedTaskHandle_);
+    if (captureTaskHandle_) vTaskSuspend(captureTaskHandle_);
+    if (toneTaskHandle_)    vTaskSuspend(toneTaskHandle_);
+    ESP_LOGW(TAG, "voice pipeline suspended for model update");
 }
 
 void VoicePipeline::feedTrampoline(void* arg)    { static_cast<VoicePipeline*>(arg)->feedTask(); }
@@ -235,6 +264,17 @@ void VoicePipeline::captureTask() {
             if (settings_.publishWakeEvent) {
                 JsonWrapper w;
                 w.AddItem("event", std::string("wake"));
+                // Detection-quality telemetry. volume_db is the input level
+                // (dB, pre-AGC) over WakeNet's ~1.5 s receptive field — the
+                // direct "what did the model hear" number for tuning
+                // mic_hw_gain_db (a 0 dB PGA once made the wakeword deaf
+                // while Whisper still transcribed fine). channel is the mic
+                // channel that triggered; wake_ms the phrase length; n a
+                // per-boot counter so gaps/reboots are visible in the stream.
+                w.AddItem("n", (int)++wakeCount_);
+                w.AddItem("volume_db", res->data_volume);
+                w.AddItem("channel", res->trigger_channel_id);
+                w.AddItem("wake_ms", (int)((uint32_t)res->wake_word_length / kSamplesPerMs));
                 w.AddTime();
                 mqtt_.publish(wakeTopic, w.ToString());
             }
@@ -275,6 +315,19 @@ void VoicePipeline::captureTask() {
                             "%smic%d rms=%.1fdB peak=%.1fdB", m ? "  " : "", m, lvl[m].rmsDb, lvl[m].peakDb);
                     }
                     ESP_LOGI(TAG, "capture levels (%ums): %s", totalMs, line);
+
+                    // Publish the same summary so gain can be tuned without a
+                    // serial console (peaks near 0 dBFS ⇒ clipping, lower
+                    // mic_hw_gain_db; far below ⇒ raise it).
+                    JsonWrapper ml;
+                    ml.AddItem("ms", (int)totalMs);
+                    for (int m = 0; m < micNum_; ++m) {
+                        const std::string p = "mic" + std::to_string(m);
+                        ml.AddItem(p + "_rms_db",  lvl[m].rmsDb);
+                        ml.AddItem(p + "_peak_db", lvl[m].peakDb);
+                    }
+                    ml.AddTime();
+                    mqtt_.publish("tele/" + settings_.sensorName + "/miclevel", ml.ToString());
                 }
 
                 if (sawSpeech && capSamples > 0) {
