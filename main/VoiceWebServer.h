@@ -4,7 +4,7 @@
 #include "esp_http_server.h"
 
 #include "JsonWrapper.h"
-#include "WebServer.h"
+#include "WifiWebServer.h"
 
 struct Settings;
 class TtsClient;
@@ -27,9 +27,9 @@ class VoicePipeline;
 //   GET  /volume         current speaker_volume as JSON
 //   POST /volume         {"volume": 0-100} -> speaker_volume, applies live
 // Handlers recover this instance from req->user_ctx.
-class VoiceWebServer : public WebServer {
+class VoiceWebServer : public WifiWebServer {
 public:
-    VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player,
+    VoiceWebServer(WifiWebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player,
                    VoicePipeline& voice);
 
     esp_err_t start() override;

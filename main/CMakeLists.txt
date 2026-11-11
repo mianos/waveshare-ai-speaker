@@ -8,7 +8,7 @@ idf_component_register(SRCS "main.cpp" "PcmPlayer.cpp" "SttClient.cpp" "TtsClien
                          wifimanager
                          settingsbase
                          mqttwrapper
-                         webserver
+                         webserver wifiwebserver
                          jsonwrapper
                          espressif__mqtt
                          board

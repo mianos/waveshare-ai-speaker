@@ -54,9 +54,9 @@ esp_err_t send_json(httpd_req_t* req, const JsonWrapper& json) {
 
 }  // namespace
 
-VoiceWebServer::VoiceWebServer(WebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player,
+VoiceWebServer::VoiceWebServer(WifiWebContext* ctx, Settings& settings, TtsClient& tts, PcmPlayer& player,
                                VoicePipeline& voice)
-    : WebServer(ctx), settings_(settings), tts_(tts), player_(player), voice_(voice) {}
+    : WifiWebServer(ctx), settings_(settings), tts_(tts), player_(player), voice_(voice) {}
 
 esp_err_t VoiceWebServer::start() {
     esp_err_t r = WebServer::start();
@@ -323,10 +323,10 @@ esp_err_t VoiceWebServer::config_reset_post_handler(httpd_req_t* req) {
     resp.AddItem("wifi_cleared", wipe_wifi);
     esp_err_t r = send_json(req, resp);
 
-    if (wipe_wifi && self->webContext && self->webContext->wifiManager) {
+    if (wipe_wifi && self->webContext && static_cast<WifiWebContext*>(self->webContext)->wifiManager) {
         ESP_LOGW(TAG, "clearing wifi credentials and rebooting");
         vTaskDelay(pdMS_TO_TICKS(500));
-        self->webContext->wifiManager->clear();
+        static_cast<WifiWebContext*>(self->webContext)->wifiManager->clear();
     }
     return r;
 }

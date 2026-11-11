@@ -66,7 +66,7 @@
 #include "WifiManager.h"
 #include "Settings.h"
 #include "MqttClient.h"
-#include "WebServer.h"
+#include "WifiWebServer.h"
 #include "VoiceWebServer.h"
 #include "JsonWrapper.h"
 
@@ -437,7 +437,7 @@ extern "C" void app_main(void) {
 
     // Web server: /healthz, /reset, /set_hostname plus /firmware, /model,
     // /config, /config/reset, /say, /play.
-    static WebContext webctx(&wifi);
+    static WifiWebContext webctx(&wifi);
     static VoiceWebServer web(&webctx, settings, tts, player, voice);
     web.start();
 
